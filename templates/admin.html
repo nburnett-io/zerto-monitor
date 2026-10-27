@@ -1,0 +1,410 @@
+{% extends "base.html" %}{% block title %}Admin · Zerto Monitor{% endblock %}
+{% block body %}
+<h1>Admin</h1>
+<div class="toc"><a href="/admin/updates"><b>Updates</b></a><a href="#security">Security</a><a href="#sources">Sources</a><a href="#vra-push">Changes to Zerto</a><a href="#tls">Hostname &amp; TLS</a><a href="#alerts">Alerting</a><a href="#ignores">Ignores</a><a href="#snmp">SNMP</a><a href="#polling">Polling &amp; storage</a><a href="#users">Users &amp; access</a><a href="#sso">Entra ID SSO</a></div>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+{% if ovfenv.held %}
+<div class="err"><b>Deploy-time passwords are still stored in vCenter.</b> This VM's vApp properties hold the {{ ovfenv.labels|join(', ') }}.
+  Anyone who can read this VM's settings in vCenter can read them{% if ovfenv.guest == 'unsupported' %}, and so can any local account on the appliance{% endif %}.
+  In vCenter: <b>VM → Edit Settings → vApp Options → Properties</b> — set each of those to blank (or turn vApp Options off), then change the passwords themselves.
+  This notice clears at the next power-on after they're blank.</div>
+{% endif %}
+
+<h2 id="security">Security</h2>
+<div class="scroll"><table>
+  <tr><th></th><th>Area</th><th>State</th></tr>
+  {% for r in posture %}
+  <tr class="{{ 'failure' if r.state == 'bad' else ('warning' if r.state == 'warn' else '') }}">
+    <td><span class="tag {{ 'failure' if r.state == 'bad' else ('warning' if r.state == 'warn' else 'ok') }}">{{ {'ok': 'ok', 'warn': 'note', 'bad': 'action'}[r.state] }}</span></td>
+    <td class="name">{{ r.area }}</td><td class="why">{{ r.what }}</td></tr>
+  {% endfor %}
+</table></div>
+
+<h2 id="sources">Sources</h2>
+{% for s in sources %}
+<div class="card {{ 'off' if not s.enabled else ('up' if s.ok else 'down') }}" style="margin-bottom:.8rem">
+  <form method="post" action="/admin/sources/{{ s.id }}">
+    <div class="formrow">
+      <label>Name<input name="name" value="{{ s.name }}" required></label>
+      <label>Kind<input value="{{ s.kind|upper }}" disabled></label>
+      <label>Host<input name="host" value="{{ s.host }}" required></label>
+      <div class="fld"><span class="fl">Auth</span><select aria-label="Auth" name="auth_type">
+          <option value="password" {{ 'selected' if s.auth_type == 'password' }}>username + password</option>
+          <option value="client_credentials" {{ 'selected' if s.auth_type == 'client_credentials' }}>API client id + secret</option>
+          <option value="basic" {{ 'selected' if s.auth_type == 'basic' }}>basic (legacy / ZCM)</option>
+        </select></div>
+      <label>Username / client id<input name="identity" value="{{ s.identity or '' }}"></label>
+      <label>Secret <span class="small">({{ 'stored — leave blank to keep' if s.has_secret else 'none' }})</span><input name="secret" type="password" autocomplete="new-password"></label>
+      <label><span>Options</span><span><input type="checkbox" name="verify_tls" value="1" {{ 'checked' if s.verify_tls }}> verify TLS &nbsp; <input type="checkbox" name="enabled" value="1" {{ 'checked' if s.enabled }}> enabled</span></label>
+      <span><button type="submit">Save</button></span>
+    </div>
+  </form>
+  <div class="small">
+    {% if s.reg_uri %}<span class="tag info">registered API client</span> created on {{ s.host }} from an initial access token; removed from Keycloak when you remove this source. &nbsp;{% endif %}
+    {% if s.ok %}<span class="tag ok">ok</span> {{ s.site }} · last {{ s.taken_at }} · {{ s.duration_ms }} ms
+    {% elif s.error %}<span class="tag failure">error</span> {{ s.error }}
+    {% else %}<span class="tag info">not polled yet</span>{% endif %}
+    &nbsp; <form class="inline" method="post" action="/admin/sources/{{ s.id }}/poll"><button class="ghost" type="submit">Poll now</button></form>
+    <form class="inline" method="post" action="/admin/sources/{{ s.id }}/delete" onsubmit='return confirm({{ ('Remove ' ~ s.name ~ '?')|tojson }})'><button class="danger" type="submit">Remove</button></form>
+    {% if s.reg_uri %}<form class="inline" method="post" action="/admin/sources/{{ s.id }}/delete" onsubmit='return confirm({{ ('Remove ' ~ s.name ~ ' WITHOUT deleting its Keycloak client? Only after you deleted it by hand.')|tojson }})'><input type="hidden" name="force" value="1"><button class="ghost mini" type="submit">remove anyway</button></form>{% endif %}
+  </div>
+  <div class="small" style="margin-top:.3rem">
+    {% if s.verify_tls %}<span class="tag ok">CA-verified</span>{% elif s.tls_pin %}<span class="tag ok" title="{{ s.tls_pin }}">certificate pinned</span>{% else %}<span class="tag warning">not pinned yet</span>{% endif %}
+    {% if not s.verify_tls %}<form class="inline" method="post" action="/admin/sources/{{ s.id }}/repin" onsubmit='return confirm({{ ('Trust the certificate ' ~ s.host ~ ' presents right now? Only do this after an expected change (e.g. a renewed certificate).')|tojson }})'><button class="ghost mini" type="submit">re-pin</button></form>{% endif %}
+    {% if s.kind == 'zvm' %} · {% if s.allow_changes %}<span class="tag warning">armed for changes</span>{% else %}<span class="tag">read-only</span> the monitor never changes anything on {{ s.name }}{% endif %} · <a href="#vra-push">Changes to Zerto</a>{% endif %}</div>
+</div>
+{% endfor %}
+
+<div class="card">
+  <strong>Add a source</strong>
+  <form method="post" action="/admin/sources" id="addSource">
+    <div class="formrow">
+      <label>Name<input name="name" placeholder="Site-A" required></label>
+      <div class="fld"><span class="fl">Kind</span><select aria-label="Kind" name="kind"><option value="zvm">ZVM</option><option value="zcm">ZCM</option></select></div>
+      <label>Host<input name="host" placeholder="zvm01.example.com" required></label>
+      <div class="fld"><span class="fl">Auth</span><select aria-label="Auth" name="auth_type" id="addAuth">
+        <option value="password">username + password</option>
+        <option value="initial_access_token">Keycloak initial access token (registers an API client)</option>
+        <option value="client_credentials">API client id + secret</option>
+        <option value="basic">basic (legacy / ZCM)</option></select></div>
+      <label id="addIdLabel">Username / client id<input name="identity" id="addIdentity"></label>
+      <label><span id="addSecretLabel">Secret</span><input name="secret" id="addSecret" type="password" autocomplete="new-password"></label>
+      <label><span>Options</span><span><input type="checkbox" name="verify_tls" value="1"> verify TLS against a CA <span class="small">(otherwise its certificate is pinned on first use)</span></span></label>
+      <span><button type="submit">Add &amp; poll</button></span>
+    </div>
+  </form>
+  <p class="small">Zerto 10 appliances: <em>username + password</em> works (Keycloak, scope=openid is handled), but the better option is a <strong>Keycloak initial access token</strong>, because then no password is stored at all. In the ZVM's Keycloak (<code>https://&lt;zvm&gt;/auth/admin</code>, realm <code>zerto</code>) go to <em>Clients → Client registration → Initial access token → Create</em> (count 1, a few minutes' expiry), copy the long token from the dialog that appears <em>once</em>, and paste it as the secret. The monitor spends it registering its own API client and keeps only that client's id and secret, encrypted; removing the source deletes the client again. Zerto 10.9 gives the new client read access by itself. If a ZVM refuses it, the source card names the one role to grant (<code>{{ viewer_role }}</code>). Opening the Keycloak console by IP while adding the ZVM by name is fine: the monitor checks they're the same server. Legacy Windows ZVMs on 9669 and the ZCM on 9989 are auto-detected.</p>
+</div>
+<script>
+(function(){var a=document.getElementById('addAuth'),i=document.getElementById('addIdentity'),
+  il=document.getElementById('addIdLabel'),sl=document.getElementById('addSecretLabel'),s=document.getElementById('addSecret');
+  function f(){var iat=a.value==='initial_access_token';i.disabled=iat;il.style.opacity=iat?.45:1;
+    sl.textContent=iat?'Initial access token':'Secret';s.placeholder=iat?'paste the token from Keycloak':'';}
+  a.addEventListener('change',f);f();})();
+</script>
+
+<h2 id="vra-push">Changes to Zerto</h2>
+<div class="card">
+  <p style="margin-top:0">The monitor is <b>read-only</b> on every ZVM unless an admin allows a kind of change below <b>and</b> arms the site. Changes use the
+    source's own credential, over the pinned certificate, once the ZVM's Keycloak grants it the rights. Each kind of change uses a client
+    that can make only that one kind of request; polling can make none. Backups need none of this: they read Zerto's own daily VPG-settings exports.</p>
+  <form method="post" action="/admin/changes" class="formrow" style="max-width:70rem">
+    <label><span>VPG restores</span><span><input type="checkbox" name="restores" value="1" {{ 'checked' if changes.restores }}> allow re-creating a deleted VPG from a backup (admin, per restore)</span></label>
+    <label><span>Recovery plans</span><span><input type="checkbox" name="plans_on" value="1" {{ 'checked' if changes.plans }}> allow creating and editing DR failover plans (engineers; deleting is admin-only)</span></label>
+    <label>Keep VPG backups (days)<input type="number" name="backup_days" min="1" max="90" value="{{ changes.backup_days }}"></label>
+    <span><button type="submit">Save</button></span>
+  </form>
+  <p class="small">Privileges the source's credential needs in the ZVM's Keycloak: <b>ManageVRA</b> for resizes, VPG management for restores and fresh exports,
+    recovery-plan management for plans. Grant only what you allow here.</p>
+  {% if changes.backups %}<div class="sub">Latest backups</div>
+  <div class="scroll"><table><tr><th>Export (UTC)</th><th>Site</th><th>Kind</th><th class="num">VPGs</th><th class="num">Size</th></tr>
+  {% for b in changes.backups %}<tr><td class="mono">{{ b.export_ts[:16].replace('T', ' ') }}</td><td>{{ b.site }}</td><td class="small">{{ b.origin }}</td><td class="num">{{ b.vpgs }}</td><td class="num">{{ ((b.bytes or 0) / 1048576)|round(1) }} MB</td></tr>{% endfor %}
+  </table></div>{% endif %}
+  {% if changes.recent %}<div class="sub">Changes sent (restores, plans)</div>
+  <div class="scroll"><table><tr><th>#</th><th>When</th><th>Kind</th><th>By</th><th>Site</th><th>Target</th><th>State</th><th>Detail</th></tr>
+  {% for c in changes.recent %}<tr class="{{ 'failure' if c.state in ('failed', 'unknown') else '' }}"><td>{{ c.id }}</td><td class="small">{{ c.at[:16].replace('T', ' ') }}</td><td class="small">{{ c.kind }}</td><td class="small">{{ c.by_user }}</td><td class="small">{{ c.site }}</td><td>{{ c.target }}</td>
+    <td><span class="tag {{ {'done': 'ok', 'failed': 'failure', 'unknown': 'failure', 'refused': 'warning'}.get(c.state, 'info') }}">{{ c.state }}</span></td><td class="why">{{ c.detail or '' }}</td></tr>{% endfor %}
+  </table></div>{% endif %}
+
+  <div class="sub">VRA resizing</div>
+  <p>Resizing a VRA through its ZVM is a <b>planned replication outage</b>. Zerto powers the VRA off, every VPG on it stops replicating, and a sync follows. So the monitor is read-only on a ZVM until all of the following are in place:
+    the switch below, the site armed, a pinned TLS certificate, and the hosts' connection method recorded as public key (VIB). Changes use the source's own credential, which Zerto must grant the right privilege (ManageVRA for resizes); the roles it actually holds are shown per site below.
+    Engineers can preview a resize; only an admin can start one. It is sent once, one at a time, with a 30-minute cooldown, 24 hours apart until five have succeeded, and at most 4 a day per site.
+    Anything but a clean finish halts resizing until an admin acknowledges it.</p>
+  {% if vra_push.halted %}<div class="err">Halted after #{{ vra_push.halted.push_id }}: {{ vra_push.halted.reason }}. Acknowledge it on that site's VRA page.</div>{% endif %}
+  <form method="post" action="/admin/vra-push" class="formrow" style="max-width:60rem">
+    <label><span>Switch</span><span><input type="checkbox" name="enabled" value="1" {{ 'checked' if vra_push.enabled }}> VRA resizing on</span></label>
+    <label><span>Notices</span><span><input type="checkbox" name="notify_info" value="1" {{ 'checked' if vra_push.notify_info }}> also email "sent" and "done" (failures always go out)</span></label>
+    <span><button type="submit">Save</button></span>
+  </form>
+  {% for s in sources if s.kind == 'zvm' %}
+  <details class="ignore" style="margin:.5rem 0" {{ 'open' if s.allow_changes }}><summary>{{ s.name }} — {% if s.allow_changes %}armed{% else %}read-only{% endif %} · credential roles: {{ (s.roles or ['unknown - not polled yet']) | join(', ') }} · certificate {{ 'pinned' if (s.push_cert_fp or s.tls_pin) else ('verified by CA' if s.verify_tls else 'not pinned') }} · hosts {{ s.push_host_auth or 'unknown' }}</summary>
+    <form method="post" action="/admin/sources/{{ s.id }}/push" class="formrow" style="margin:.4rem 0;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr))">
+      <div class="fld"><span class="fl">Hosts connect by</span><select aria-label="Hosts connect by" name="host_auth">{% for v, t in (('unknown', 'not checked'), ('vib', 'public key (VIB)'), ('password', 'root password - out of scope')) %}<option value="{{ v }}" {{ 'selected' if (s.push_host_auth or 'unknown') == v }}>{{ t }}</option>{% endfor %}</select></div>
+      <label><span>Certificate</span><span><input type="checkbox" name="pin" value="1"> {{ 're-pin' if s.push_cert_fp else 'pin' }} the certificate {{ s.host }} presents now</span></label>
+      <label><span>Armed</span><span><input type="checkbox" name="allow" value="1" {{ 'checked' if s.allow_changes }}> allow the changes switched on above on {{ s.name }}</span></label>
+      <span><button type="submit">Save</button></span>
+    </form>
+    <div class="small">{% if s.push_cert_fp %}Pinned SHA-256 <code>{{ s.push_cert_fp }}</code>. {% endif %}{% if s.push_host_auth_by %}Connection method recorded by {{ s.push_host_auth_by }} {{ (s.push_host_auth_at or '')[:10] }}. {% endif %}
+      Check the connection method in the Zerto UI (Setup → VRAs → Edit VRA). Edit VRA can't be sent safely for password-mode hosts.
+      To let the credential make changes, grant it Zerto rights in the ZVM's Keycloak (realm zerto): for a registered client, <i>Clients → its client → Service account roles → Assign role → zerto-client</i>; for a user, that user's role mapping.</div>
+  </details>
+  {% endfor %}
+</div>
+
+<h2 id="tls">Hostname &amp; TLS</h2>
+<div class="card">
+  {% if not helper %}<div class="note">The privileged helper isn't installed on this host, so changes here can't be applied. On the appliance run <code>sudo python3 /opt/zerto-monitor/firstboot.py --upgrade</code>.</div>{% endif %}
+  <dl class="kv">
+    <dt>Hostname</dt><dd>{{ host.short or '?' }}{% if host.fqdn and host.fqdn != host.short %} &nbsp;<span class="small">({{ host.fqdn }})</span>{% endif %}</dd>
+    {% if tls.present %}
+    <dt>Certificate</dt><dd>{{ tls.subject }}</dd>
+    <dt>Issuer</dt><dd>{{ tls.issuer }} {% if tls.self_signed %}<span class="tag warning">self-signed</span>{% else %}<span class="tag ok">CA-issued</span>{% endif %}</dd>
+    <dt>Valid</dt><dd>{{ tls.not_before }} → {{ tls.not_after }} &nbsp;<span class="tag {{ 'failure' if tls.days_left < 14 else ('warning' if tls.days_left < 45 else 'ok') }}">{{ tls.days_left }} days left</span></dd>
+    <dt>Names</dt><dd class="mono" style="font-family:var(--mono);font-size:.8rem">{{ tls.sans|join(', ') or '(none)' }}</dd>
+    <dt>Key</dt><dd>{{ tls.key_algo }}{% if tls.chain_len and tls.chain_len > 1 %} · chain of {{ tls.chain_len }}{% endif %}</dd>
+    <dt>SHA-256</dt><dd style="font-family:var(--mono);font-size:.72rem">{{ tls.fingerprint }}</dd>
+    {% else %}
+    <dt>Certificate</dt><dd><span class="tag failure">none</span> {{ tls.error }}</dd>
+    {% endif %}
+  </dl>
+  <p class="small">This appliance serves <strong>HTTPS only</strong>: port 80 answers solely with a redirect to 443, and browsers are told to stay on HTTPS (HSTS). The private key is root-only and never readable by the web app.</p>
+
+  <div class="sub">Hostname</div>
+  <form method="post" action="/admin/hostname" class="formrow" style="max-width:44rem">
+    <label>Short hostname<input name="hostname" value="{{ host.short }}" pattern="[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?" required></label>
+    <label><span>Certificate</span><span><input type="checkbox" name="regen" value="1" {{ 'checked' if tls.self_signed }}> issue a new self-signed cert for it</span></label>
+    <span><button type="submit">Set hostname</button></span>
+  </form>
+
+  <div class="sub">Self-signed certificate</div>
+  <form method="post" action="/admin/tls/selfsigned" class="formrow" style="max-width:44rem">
+    <label>DNS name (CN)<input name="fqdn" value="{{ host.fqdn or host.short }}" required></label>
+    <label>Valid for (days)<input name="days" type="number" min="1" max="7300" value="3650"></label>
+    <span><button type="submit">Generate &amp; install</button></span>
+  </form>
+  <p class="small">Covers the DNS name, the short name, and every IP this appliance answers on, so it works by address too. Browsers will still warn until the certificate is trusted.</p>
+
+  <div class="sub">Install a CA-issued certificate</div>
+  <form method="post" action="/admin/tls/upload" enctype="multipart/form-data">
+    <div class="formrow">
+      <label>Certificate (PEM)<input type="file" name="cert" accept=".pem,.crt,.cer"></label>
+      <label>Private key (PEM, unencrypted)<input type="file" name="key" accept=".pem,.key"></label>
+      <label>Intermediate chain (optional)<input type="file" name="chain" accept=".pem,.crt,.cer"></label>
+    </div>
+    <div class="formrow">
+      <label>— or — a .pfx / .p12<input type="file" name="pfx" accept=".pfx,.p12"></label>
+      <label>.pfx password<input type="password" name="pfx_password" autocomplete="off"></label>
+      <span><button type="submit">Validate &amp; install</button></span>
+    </div>
+  </form>
+  <p class="small">Checked before anything changes: the key must match the certificate, and the certificate must not be expired. nginx is tested with the new pair and the previous pair is restored automatically if it's refused, so a bad upload can't take the site down.</p>
+</div>
+
+<h2 id="alerts">Alerting</h2>
+<div class="card">
+  <form method="post" action="/admin/alerts/settings">
+    <div class="formrow">
+      <label><span>Status</span><span><input type="checkbox" name="enabled" value="1" {{ 'checked' if acfg.alerts_enabled }}> send alerts</span></label>
+      <label>Default recipients<input name="recipients" value="{{ acfg.alert_default_recipients }}" placeholder="noc@example.com, oncall@…"></label>
+      <label>Remind every (hours, 0 = never)<input name="repeat_hours" type="number" min="0" max="720" value="{{ acfg.alert_repeat_hours }}"></label>
+      <label><span>Recovery</span><span><input type="checkbox" name="notify_clear" value="1" {{ 'checked' if acfg.alert_notify_clear }}> notify when healthy again</span></label>
+      <label>Link base for emails<input name="public_url" value="{{ acfg.public_url }}" placeholder="https://{{ host.fqdn or host.short }}"></label>
+      <span><button type="submit">Save</button></span>
+    </div>
+  </form>
+  <p class="small">Each zORG is judged by its worst VPG, against two clocks: how long it has been <strong>continuously failing</strong>, and how long <strong>continuously not healthy</strong>. A rule fires <span class="tag failure">failure</span> once the first passes its error threshold, and <span class="tag warning">warning</span> once the second passes its warning threshold, so a zORG flapping between the two can't keep resetting its own timer. You're told when the level rises, reminded while it holds, and told once when it recovers. Email is one digest per recipient per poll; each event is also one SNMP trap. A ZVM that stops answering is alerted the same way, as <code>[source] name</code>.</p>
+  {% if not acfg.alerts_enabled %}
+  <div class="note">Alerting is off. The clocks are running regardless{% if would_fire %}: switching it on now would announce <strong>{{ would_fire|length }}</strong> zORG{{ '' if would_fire|length == 1 else 's' }} already past threshold ({% for w in would_fire[:6] %}{{ w.name }} {{ w.level }}{{ ', ' if not loop.last }}{% endfor %}{{ '…' if would_fire|length > 6 }}){% else %}, and nothing is past threshold right now{% endif %}.</div>
+  {% endif %}
+
+  <div class="sub">Rules</div>
+  <div class="scroll"><table>
+    <tr><th>zORG</th><th>Failure after (min)</th><th>Warning after (min)</th><th>Recipients</th><th>Email</th><th>Trap</th><th>On</th><th></th></tr>
+    {% for r in rules %}
+    {# a <form> can't wrap table cells, so each row's inputs join it via form="…" #}
+    <tr>
+      <td><form id="rule{{ r.id }}" method="post" action="/admin/alerts/rules"><input type="hidden" name="zorg" value="{{ r.zorg }}"></form><strong>{{ 'every zORG (default)' if r.zorg == '*' else r.zorg }}</strong></td>
+      <td><input form="rule{{ r.id }}" name="error_minutes" type="number" min="1" max="10080" value="{{ r.error_minutes }}" style="width:6rem"></td>
+      <td><input form="rule{{ r.id }}" name="warning_minutes" type="number" min="1" max="10080" value="{{ r.warning_minutes }}" style="width:6rem"></td>
+      <td><input form="rule{{ r.id }}" name="recipients" value="{{ r.recipients or '' }}" placeholder="default recipients" style="min-width:14rem"></td>
+      <td><input form="rule{{ r.id }}" type="checkbox" name="email" value="1" {{ 'checked' if r.email }} aria-label="email"></td>
+      <td><input form="rule{{ r.id }}" type="checkbox" name="snmp" value="1" {{ 'checked' if r.snmp }} aria-label="trap"></td>
+      <td><input form="rule{{ r.id }}" type="checkbox" name="enabled" value="1" {{ 'checked' if r.enabled }} aria-label="enabled"></td>
+      <td style="white-space:nowrap"><button form="rule{{ r.id }}" class="ghost" type="submit">Save</button>
+        {% if r.zorg != '*' %}<form class="inline" method="post" action="/admin/alerts/rules/{{ r.id }}/delete"><button class="danger" type="submit">Delete</button></form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  <form method="post" action="/admin/alerts/rules" class="formrow">
+    <label>zORG<input name="zorg" list="zorgList" placeholder="type or pick a zORG" required></label>
+    <label>Failure after (min)<input name="error_minutes" type="number" min="1" max="10080" value="15"></label>
+    <label>Warning after (min)<input name="warning_minutes" type="number" min="1" max="10080" value="60"></label>
+    <label>Recipients<input name="recipients" placeholder="blank = default recipients"></label>
+    <label><span>Channels</span><span><input type="checkbox" name="email" value="1" checked> email &nbsp;<input type="checkbox" name="snmp" value="1" checked> trap &nbsp;<input type="checkbox" name="enabled" value="1" checked> on</span></label>
+    <span><button type="submit">Add rule</button></span>
+  </form>
+  <datalist id="zorgList">{% for z in zorg_names %}<option value="{{ z }}">{% endfor %}</datalist>
+  <p class="small">A zORG uses its own rule if it has one, otherwise the default. Untick <em>On</em> to mute a zORG entirely, e.g. a customer being onboarded.</p>
+
+  <div class="sub">Email (SMTP)</div>
+  <form method="post" action="/admin/alerts/smtp">
+    <div class="formrow">
+      <label>Server<input name="host" value="{{ acfg.smtp_host }}" placeholder="smtp.office365.com"></label>
+      <label>Port<input name="port" type="number" value="{{ acfg.smtp_port }}"></label>
+      <div class="fld"><span class="fl">Security</span><select aria-label="Security" name="security">
+        <option value="starttls" {{ 'selected' if acfg.smtp_security == 'starttls' }}>STARTTLS (587)</option>
+        <option value="ssl" {{ 'selected' if acfg.smtp_security == 'ssl' }}>TLS (465)</option>
+        <option value="none" {{ 'selected' if acfg.smtp_security == 'none' }}>none (internal relay)</option></select></div>
+      <label>Username<input name="username" value="{{ acfg.smtp_user }}" autocomplete="off" placeholder="blank for an open relay"></label>
+      <label>Password <span class="small">({{ 'stored — blank keeps it' if acfg.smtp_has_password else 'none' }})</span><input name="password" type="password" autocomplete="new-password"></label>
+      <label>From<input name="sender" value="{{ acfg.smtp_from }}" placeholder="zerto-monitor@example.com"></label>
+      <label><span>Options</span><span><input type="checkbox" name="verify" value="1" {{ 'checked' if acfg.smtp_verify }}> verify server certificate{% if acfg.smtp_has_password %} &nbsp;<input type="checkbox" name="clear_password" value="1"> forget password{% endif %}</span></label>
+      <span><button type="submit">Save</button></span>
+    </div>
+  </form>
+  <form method="post" action="/admin/alerts/test-email" class="formrow" style="max-width:36rem">
+    <label>Send a test to<input name="to" placeholder="blank = default recipients"></label>
+    <span><button class="ghost" type="submit">Send test email</button></span>
+  </form>
+
+  <div class="sub">SNMP traps</div>
+  <form method="post" action="/admin/alerts/snmp-trap">
+    <div class="formrow">
+      <label><span>Status</span><span><input type="checkbox" name="enabled" value="1" {{ 'checked' if acfg.snmp_trap_enabled }}> send traps</span></label>
+      <label>Receivers<input name="targets" value="{{ acfg.snmp_trap_targets }}" placeholder="192.0.2.50, nms.example.com:162"></label>
+      <label>Community <span class="small">({{ 'stored — blank keeps it' if acfg.snmp_trap_has_community else 'none' }})</span><input name="community" type="password" autocomplete="new-password"></label>
+      <label>Base OID<input name="oid" value="{{ acfg.snmp_trap_oid }}" placeholder="{{ default_trap_oid }}"></label>
+      <span><button type="submit">Save</button></span>
+    </div>
+  </form>
+  <form method="post" action="/admin/alerts/test-trap" class="inline"><button class="ghost" type="submit">Send test trap</button></form>
+  <p class="small">SNMPv2c. Trap OIDs: <code>&lt;base&gt;.0.1</code> alert, <code>.0.2</code> cleared, <code>.0.3</code> test. Varbinds under <code>&lt;base&gt;.1</code>: .1 zORG, .2 level, .3 event, .4 minutes, .5 failing VPGs, .6 warning VPGs, .7 total VPGs, .8 summary, .9 link. The default base sits in net-snmp's experimental arc; set your own enterprise number if you have one.</p>
+
+  <div class="sub">Current state</div>
+  {% if alert_states %}
+  <div class="scroll"><table>
+    <tr><th>zORG</th><th>Health</th><th>Failing for</th><th>Not healthy for</th><th>Alerted</th></tr>
+    {% for s in alert_states %}
+    <tr class="{{ s.health }}"><td>{{ s.zorg }}</td><td><span class="tag {{ s.health }}">{{ s.health }}</span></td>
+      <td class="num">{{ s.fail_for }}</td><td class="num">{{ s.bad_for }}</td>
+      <td>{% if s.alerted %}<span class="tag {{ s.alerted }}">{{ s.alerted }}</span>{% endif %}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% else %}<p class="small">Every zORG is healthy (or nothing has been evaluated yet - that happens after each full poll).</p>{% endif %}
+
+  <div class="sub">Recent alerts</div>
+  {% if alert_log %}
+  <div class="scroll"><table>
+    <tr><th>When (UTC)</th><th>zORG</th><th>Event</th><th>Level</th><th>Summary</th><th>Delivery</th></tr>
+    {% for a in alert_log %}
+    <tr><td class="mono">{{ a.at[:16].replace('T', ' ') }}</td><td>{{ a.zorg }}</td><td>{{ a.event }}</td>
+      <td>{% if a.level %}<span class="tag {{ a.level }}">{{ a.level }}</span>{% endif %}</td>
+      <td class="why">{{ a.summary }}</td>
+      <td class="small">{% if not a.ok %}<span class="tag failure">failed</span> {% endif %}{{ a.channels }}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% else %}<p class="small">Nothing sent yet.</p>{% endif %}
+</div>
+
+<h2 id="ignores">Ignores</h2>
+<div class="card">
+  {% set live = ignores|selectattr('expires_at', 'none')|list + ignores|rejectattr('expires_at', 'none')|selectattr('expires_at', 'gt', now_iso)|list %}
+  {% if ignores %}
+  <div class="scroll"><table>
+    <tr><th>What</th><th>Covers</th><th>Note</th><th>Set by</th><th>Until</th><th></th></tr>
+    {% for i in ignores %}{% set expired = i.expires_at and i.expires_at <= now_iso %}
+    <tr style="{{ 'opacity:.55' if expired else '' }}">
+      <td>{% if i.scope == 'zorg' %}zORG <a href="/zorgs/{{ i.target|urlencode }}">{{ i.label }}</a>{% else %}VPG {{ i.label }}{% endif %}</td>
+      <td class="small">{% if i.mode == 'all' %}<b>everything</b>{% else %}the {{ i.snapshot|length }} problem{{ '' if i.snapshot|length == 1 else 's' }} seen when set{% set codes = [] %}{% for k, s in i.snapshot.items() %}{% for c in s.codes %}{% if c not in codes %}{% set _ = codes.append(c) %}{% endif %}{% endfor %}{% endfor %}{% if codes %} ({{ codes|join(', ') }}){% endif %}{% endif %}</td>
+      <td class="why">{{ i.note or '' }}</td>
+      <td class="small">{{ i.created_by }}<br>{{ (i.created_at or '')[:16].replace('T', ' ') }}</td>
+      <td class="small">{% if not i.expires_at %}until removed{% elif expired %}<span class="tag info">expired</span>{% else %}{{ i.expires_at[:16].replace('T', ' ') }}{% endif %}</td>
+      <td><form class="inline" method="post" action="/admin/ignores/{{ i.id }}/delete"><input type="hidden" name="back" value="/admin#ignores"><button class="danger" type="submit">Remove</button></form></td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  {% else %}<p class="small" style="margin-top:0">Nothing is ignored. Use "ignore…" on a VPG on the dashboard, or on a zORG's page.</p>{% endif %}
+  <div class="sub" id="code-ignores">Ignored Zerto alert codes (every VPG)</div>
+  {% set ci = code_ignores %}
+  {% if ci.rows %}
+  <div class="scroll"><table>
+    <tr><th>Code</th><th class="num">Hides now</th><th>Why</th><th>Set by</th><th>Until</th><th></th></tr>
+    {% for r in ci.rows %}
+    <tr style="{{ 'opacity:.55' if r.expired else '' }}"><td class="mono">{{ r.code }}</td><td class="num">{{ r.covers }} VPG{{ '' if r.covers == 1 else 's' }}</td>
+      <td class="why">{{ r.note or '' }}</td><td class="small">{{ r.created_by }}<br>{{ (r.created_at or '')[:16].replace('T', ' ') }}</td>
+      <td class="small">{% if not r.expires_at %}until removed{% elif r.expired %}<span class="tag info">expired</span>{% else %}{{ r.expires_at[:16].replace('T', ' ') }}{% endif %}</td>
+      <td><form class="inline" method="post" action="/admin/code-ignores/{{ r.code|urlencode }}/delete"><button class="danger" type="submit">Remove</button></form></td></tr>
+    {% endfor %}
+  </table></div>
+  {% else %}<p class="small" style="margin-top:0">No alert code is ignored globally.</p>{% endif %}
+  <form method="post" action="/admin/code-ignores" class="formrow" style="max-width:64rem">
+    <label>Zerto alert code<input name="code" list="liveCodes" required pattern="[A-Za-z]{2,6}[0-9]{3,5}" placeholder="VPG0035" style="text-transform:uppercase"></label>
+    <div class="fld"><span class="fl">For</span><select aria-label="For" name="days"><option value="0" selected>until removed</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></div>
+    <label>Why (shown on every VPG it hides)<input name="note" required minlength="5" maxlength="300" placeholder="e.g. customer-side zORG mapping, accepted - ticket"></label>
+    <span><button type="submit">Ignore this code everywhere</button></span>
+  </form>
+  <datalist id="liveCodes">{% for c, n in ci.seen %}<option value="{{ c }}">{{ n }} unhealthy VPG{{ '' if n == 1 else 's' }}</option>{% endfor %}</datalist>
+  {% if ci.seen %}<p class="small">On unhealthy VPGs right now: {% for c, n in ci.seen %}<span class="mono">{{ c }}</span> ×{{ n }}{{ ', ' if not loop.last }}{% endfor %}.</p>{% endif %}
+  <p class="small">A VPG is ignored by code only when <b>every</b> live alert on it has an ignored code <b>and</b> its replication is otherwise healthy, so an RPO breach, a sync problem or any other alert still raises it. It stays visible with an "ignored: CODE (global)" badge, and drops out of the counts, the alert emails and the SNMP figures. Admins only.</p>
+
+  <p class="small">An ignore takes a VPG (or a whole zORG) out of the attention counts, alerting and SNMP failure/warning figures - it stays visible, badged. "Current problems" ignores lift by themselves the moment anything new or worse happens (another alert code, an RPO breach, a higher Zerto alert level), so they can't hide a fresh problem. Expired ignores are kept here for 30 days, then purged.</p>
+</div>
+
+<h2 id="snmp">SNMP polling</h2>
+<div class="card">
+  <form method="post" action="/admin/alerts/snmp-agent">
+    <div class="formrow">
+      <label><span>Status</span><span><input type="checkbox" name="enabled" value="1" {{ 'checked' if acfg.snmp_agent_enabled }}> answer SNMP on udp/161</span></label>
+      <label>Read community <span class="small">({{ 'stored — blank keeps it' if acfg.snmp_agent_has_community else 'none' }})</span><input name="community" type="password" autocomplete="new-password" minlength="6"></label>
+      <label>Allowed source network<input name="source" value="{{ acfg.snmp_agent_source if acfg.snmp_agent_source != 'default' else '' }}" placeholder="192.0.2.0/24" pattern="[0-9./]+"></label>
+      <span><button type="submit">Apply</button></span>
+    </div>
+  </form>
+  <p class="small">For your RMM / network monitoring system to poll this appliance. SNMPv2c, read-only, limited to the source you allow. Use a network rather than <code>default</code> where you can: v2c communities cross the wire unencrypted. Each value is <code>NET-SNMP-EXTEND-MIB::nsExtendOutput1Line."name"</code>; the same numbers are at <a href="/api/metrics">/api/metrics</a> as JSON.</p>
+  <div class="scroll"><table>
+    <tr><th>Name</th><th>Meaning</th><th>Numeric OID</th></tr>
+    {% for o in snmp_oids %}<tr><td class="mono">{{ o.name }}</td><td>{{ o.desc }}</td><td class="mono" style="font-size:.72rem">{{ o.oid }}</td></tr>{% endfor %}
+  </table></div>
+</div>
+
+<h2 id="polling">Polling &amp; storage</h2>
+<form method="post" action="/admin/settings" class="formrow" style="max-width:36rem">
+  <label>Poll interval (seconds, min 30)<input name="poll_interval" type="number" min="30" value="{{ poll_interval }}"></label>
+  <label>Keep history (days)<input name="history_days" type="number" min="1" max="365" value="{{ history_days }}"></label>
+  <span><button type="submit">Save</button></span>
+</form>
+<form class="inline" method="post" action="/admin/poll-all"><button class="ghost" type="submit">Poll all sources now</button></form>
+<form class="inline" method="post" action="/admin/scrub"><button class="ghost" type="submit">Scrub &amp; compact DB</button></form>
+<p class="small">Pages read the latest snapshot from SQLite (WAL) — they never poll a ZVM on load.
+<em>Scrub</em> checkpoints the WAL and VACUUMs with <code>secure_delete</code> so rotated or removed secrets are physically zeroed on disk (also runs automatically after credential migrations). Each poll also appends a compact history row (counts only) for the "vs 24h ago" trend and <code>/api/history</code>.
+Credentials at rest: source usernames and secrets, Keycloak registration tokens, the SMTP password, SNMP communities and the Entra client secret are Fernet-encrypted; admin passwords are bcrypt hashes. Encryption key source: <code>{{ key_source }}</code>.</p>
+
+<h2 id="users">Users &amp; access</h2>
+<div class="card">
+  <form method="post" action="/admin/access" class="formrow" style="max-width:60rem">
+    <label><span>Require sign-in</span><span><input type="checkbox" name="require_login" value="1" {{ 'checked' if require_login }}> every page and API needs a session</span></label>
+    <span><button type="submit">Save</button></span>
+  </form>
+  <p class="small" style="margin-bottom:0">{% if require_login %}<b>On</b> — anonymous visitors are sent to the sign-in page. (The appliance's own SNMP agent still reads <code>/api/metrics</code> over loopback.)
+  {% else %}<b>Off</b> — anyone who can reach this appliance can <em>read</em> the dashboards and JSON API; changing anything needs a sign-in. Turn this on for production.{% endif %}<br>
+  Roles: <span class="tag">viewer</span> read-only &nbsp;·&nbsp; <span class="tag info">engineer</span> + ignores and VRA sizing on the dashboards &nbsp;·&nbsp; <span class="tag failure">admin</span> + this page: sources, credentials, TLS, alerting, users, SSO.</p>
+</div>
+<div class="scroll"><table>
+  <tr><th>User</th><th>Role</th><th class="c2">Source</th><th class="c3">Created</th><th class="c2">Last login</th><th>Actions</th></tr>
+  {% for u in users %}{% set r = u.role or ('admin' if u.is_admin else 'viewer') %}
+  <tr><td class="name">{{ u.username }}</td>
+    <td>{% if u.auth_source == 'entra' %}<span class="tag {{ 'failure' if r == 'admin' else ('info' if r == 'engineer' else '') }}">{{ r }}</span> <span class="small">from groups</span>
+        {% else %}<form class="inline" method="post" action="/admin/users/{{ u.username|urlencode }}/role"><select name="role" aria-label="role for {{ u.username }}">{% for x in ('viewer', 'engineer', 'admin') %}<option value="{{ x }}" {{ 'selected' if x == r }}>{{ x }}</option>{% endfor %}</select> <button class="ghost" type="submit">Set</button></form>{% endif %}</td>
+    <td class="c2"><span class="tag {{ 'info' if u.auth_source == 'entra' else 'ok' }}">{{ u.auth_source or 'local' }}</span></td>
+    <td class="small c3">{{ (u.created_at or '')[:10] }}</td><td class="small c2">{{ (u.last_login or '')[:16] }}</td>
+    <td>{% if u.auth_source != 'entra' %}<form class="inline" method="post" action="/admin/users/{{ u.username|urlencode }}/password"><input name="password" type="password" placeholder="new password" minlength="10" autocomplete="new-password"> <button class="ghost" type="submit">Reset</button></form>{% endif %}
+        {% if u.username != user.username %}<form class="inline" method="post" action="/admin/users/{{ u.username|urlencode }}/delete" onsubmit='return confirm({{ ('Delete ' ~ u.username ~ '?')|tojson }})'><button class="danger" type="submit">Delete</button></form>{% endif %}</td></tr>
+  {% endfor %}
+</table></div>
+<form method="post" action="/admin/users" class="formrow" style="max-width:48rem">
+  <label>Username<input name="username" required></label>
+  <label>Password (10+)<input name="password" type="password" minlength="10" required autocomplete="new-password"></label>
+  <div class="fld"><span class="fl">Role</span><select aria-label="Role" name="role">{% for x in ('viewer', 'engineer', 'admin') %}<option value="{{ x }}" {{ 'selected' if x == 'engineer' }}>{{ x }}</option>{% endfor %}</select></div>
+  <span><button type="submit">Add local user</button></span>
+</form>
+
+<h2 id="sso">Entra ID single sign-on</h2>
+<div class="card">
+  <form method="post" action="/admin/sso">
+    <div class="formrow">
+      <label><span>Enabled</span><span><input type="checkbox" name="entra_enabled" value="1" {{ 'checked' if sso.entra_enabled == 'true' }}></span></label>
+      <label>Tenant ID<input name="entra_tenant_id" value="{{ sso.entra_tenant_id }}" placeholder="00000000-0000-0000-0000-000000000000"></label>
+      <label>Application (client) ID<input name="entra_client_id" value="{{ sso.entra_client_id }}"></label>
+      <label>Client secret <span class="small">({{ 'stored — blank keeps it' if sso.has_secret else 'none' }})</span><input name="entra_client_secret" type="password" autocomplete="new-password"></label>
+      <label>Redirect URI <span class="small">(blank = this host + /auth/callback)</span><input name="entra_redirect_uri" value="{{ sso.entra_redirect_uri }}" placeholder="https://{{ host.fqdn or 'zertomon.example.com' }}/auth/callback"></label>
+      <label>Admin app-role value <span class="small">(or group object ID; never the group name)</span><input name="entra_admin_group" value="{{ sso.entra_admin_group }}" placeholder="ZertoMonitor.Admin"></label>
+      <label>Engineer app-role value <span class="small">(or group object ID; never the group name)</span><input name="entra_engineer_group" value="{{ sso.entra_engineer_group }}" placeholder="ZertoMonitor.Engineer"></label>
+      <label>Sign-in button label <span class="small">(blank = "Sign in with Entra ID")</span><input name="entra_button_label" value="{{ sso.entra_button_label }}" maxlength="80" placeholder="Sign in with Entra ID (corp.example.com)"></label>
+      <span><button type="submit">Save SSO</button></span>
+    </div>
+  </form>
+  <p class="small">App registration: Web platform, redirect URI as above (it must be <code>https://</code>), <em>ID tokens</em> enabled, <strong>Token configuration → add groups claim</strong> (security groups) or assign app roles.
+  At every sign-in the role is re-read from the token: <b>admin group → admin</b>, else <b>engineer group → engineer</b>, else <b>viewer</b>. Removing someone from a group takes effect at their next sign-in (sessions last {{ session_hours }} hours); deleting them below ends their session at once. A group left blank grants that role to nobody.</p>
+</div>
+{% endblock %}

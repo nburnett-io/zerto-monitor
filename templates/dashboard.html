@@ -1,0 +1,104 @@
+{% extends "base.html" %}{% block title %}VPG issues · Zerto Monitor{% endblock %}
+{% set autorefresh = 60 %}
+{% block body %}{% import "_ignore.html" as ig %}{% import "_fix.html" as fx %}
+<h1>VPGs needing attention</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+
+<div class="strip">
+  <div class="cell"><div class="k">VPGs (deduped)</div><div class="v">{{ totals.vpgs }}</div></div>
+  <div class="cell"><div class="k">Failure</div><div class="v fail">{{ totals.failure }}</div></div>
+  <div class="cell"><div class="k">Warning</div><div class="v warn">{{ totals.warning }}</div></div>
+  <div class="cell"><div class="k">Healthy</div><div class="v good">{{ totals.healthy }}</div></div>
+  {% if totals.ignored %}<div class="cell"><div class="k"><a href="#ignored">Ignored</a></div><div class="v">{{ totals.ignored }}</div></div>{% endif %}
+  <div class="cell"><div class="k">VRAs disconnected</div><div class="v {{ 'fail' if totals.vras_disconnected else 'good' }}">{{ totals.vras_disconnected }}</div></div>
+  <div class="cell"><div class="k">VRA mask drift</div><div class="v {{ 'warn' if totals.vras_mask_mismatch else 'good' }}">{{ totals.vras_mask_mismatch }}</div></div>
+  <div class="cell"><div class="k">Sources down</div><div class="v {{ 'fail' if totals.sources_down else 'good' }}">{{ totals.sources_down }}</div></div>
+  {% if totals.trend %}{% set t = totals.trend %}
+  <div class="cell"><div class="k">vs {{ t.hours }}h ago</div>
+    <div class="v" style="font-size:1rem">
+      <span class="{{ 'fail' if t.failure_delta > 0 else ('good' if t.failure_delta < 0 else '') }}">{{ '%+d'|format(t.failure_delta) }} fail</span>
+      &nbsp;<span class="{{ 'warn' if t.warning_delta > 0 else ('good' if t.warning_delta < 0 else '') }}">{{ '%+d'|format(t.warning_delta) }} warn</span>
+    </div><div class="small">since {{ t.since[:16] }}</div></div>
+  {% endif %}
+</div>
+
+<div class="grid2">
+  <div>
+    <h2>Sources</h2>
+    <div class="scroll"><table>
+      <tr><th>Source</th><th>Site</th><th>Version</th><th>State</th><th>Last poll</th><th class="num">Fail</th><th class="num">Warn</th></tr>
+      {% for s in sites %}
+      <tr>
+        <td>{{ s.name }}<div class="small">{{ s.kind|upper }} · {{ s.host }}</div></td>
+        <td>{{ s.site or '' }}</td><td class="mono">{{ s.version or '' }}</td>
+        <td>{% if not s.enabled %}<span class="tag info">disabled</span>
+            {% elif s.ok %}<span class="tag ok">ok</span>
+            {% else %}<span class="tag failure">down</span>{% if s.stale %} <span class="small">(showing last good)</span>{% endif %}
+            <div class="why">{{ s.error }}</div>{% endif %}</td>
+        <td class="small">{{ s.age }}</td>
+        <td class="num">{{ s.counts.failure if s.counts else '' }}</td>
+        <td class="num">{{ s.counts.warning if s.counts else '' }}</td>
+      </tr>
+      {% else %}<tr><td colspan="7" class="small">No sources yet — add a ZVM in <a href="/admin">Admin</a>.</td></tr>{% endfor %}
+    </table></div>
+  </div>
+  <div>
+    <h2>Most affected zORGs</h2>
+    <div class="scroll"><table>
+      <tr><th>zORG</th><th class="num">Failure</th><th class="num">Warning</th></tr>
+      {% for name, c in top_orgs %}
+      <tr><td><a href="/zorgs/{{ name|urlencode }}">{{ name }}</a></td><td class="num">{{ c.failure }}</td><td class="num">{{ c.warning }}</td></tr>
+      {% else %}<tr><td colspan="3" class="small">Nothing unhealthy.</td></tr>{% endfor %}
+    </table></div>
+  </div>
+</div>
+
+{% set filtered = f.zorg or f.q or f.health or f.zvm %}
+<h2 id="vpgs">{% if filtered %}{{ vpgs|length }} of {{ shown.vpgs_all }}{% else %}{{ vpgs|length }}{% endif %} VPGs in failure or warning</h2>
+<form method="get" action="/#vpgs" class="formrow" style="max-width:72rem">
+  <div class="fld"><span class="fl">zORG</span><select aria-label="zORG" name="zorg"><option value="">all zORGs</option>{% for z in options.zorgs %}<option value="{{ z }}" {{ 'selected' if z == f.zorg }}>{{ z }}</option>{% endfor %}</select></div>
+  <label>VPG name contains<input name="q" value="{{ f.q }}" placeholder="any part of the name"></label>
+  <div class="fld"><span class="fl">State</span><select aria-label="State" name="health"><option value="">failure + warning</option>{% for h in ('failure', 'warning') %}<option value="{{ h }}" {{ 'selected' if h == f.health }}>{{ h }}</option>{% endfor %}</select></div>
+  <div class="fld"><span class="fl">ZVM</span><select aria-label="ZVM" name="zvm"><option value="">any ZVM</option>{% for z in options.zvms %}<option value="{{ z }}" {{ 'selected' if z == f.zvm }}>{{ z }}</option>{% endfor %}</select></div>
+  <span><button type="submit">Filter</button>{% if filtered %} <a class="btn ghost" href="/#vpgs">clear</a>{% endif %}</span>
+</form>
+<div class="scroll"><table>
+  <tr><th>State</th><th>VPG</th><th>zORG</th><th class="c1">Status / substatus</th><th>Why</th><th>Suggested fix</th><th class="num">RPO</th><th class="num c3">Progress</th><th class="num c3">MiB/s</th><th class="c2">Path</th></tr>
+  {% for v in vpgs %}
+  <tr class="{{ v.health }}">
+    <td><span class="tag {{ v.health }}">{{ v.health }}</span>
+      {% if user and user.can_operate %}{{ ig.form('vpg', v.key, v.name, here) }}{% endif %}</td>
+    <td class="name"><a href="/vpgs/{{ v.key|urlencode }}">{{ v.name }}</a><div class="small">{{ v.vms }} VM{{ '' if v.vms == 1 else 's' }} · seen on {{ v.seen_on|join(', ') }}</div></td>
+    <td><a href="/zorgs/{{ (v.org or '(no zORG)')|urlencode }}">{{ v.org or '—' }}</a></td>
+    <td class="mono c1">{{ v.status }}<br>{{ v.sub }}</td>
+    <td class="why">{{ v.why }}
+      {% if v.ignore_lapsed %}{{ ig.lapsed(v.ignore_lapsed) }}{% endif %}
+      {% if v.alerts %}<details><summary>{{ v.alerts|length }} alert{{ '' if v.alerts|length == 1 else 's' }}</summary>
+        {% for a in v.alerts %}<div class="small"><span class="tag {{ 'failure' if a.level == 'Error' else 'warning' }}">{{ a.id }}</span> {{ a.text }}</div>{% endfor %}</details>{% endif %}
+    </td>
+    <td class="fix">{{ fx.cell(v.fixes, v.fix_keys, here, user) }}</td>
+    <td class="num">{{ v.rpo_h }}</td>
+    <td class="num c3">{% if v.sub != 'None' %}{{ '%.0f'|format(v.progress) }}%{% endif %}</td>
+    <td class="num c3">{{ '%.1f'|format(v.thru) }}</td>
+    <td class="small c2">{{ v.protected_site }} → {{ v.recovery_site }}{% if v.protected_hosts %}<br>{{ v.protected_hosts|join(', ') }}{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="10" class="small">{% if filtered %}No VPG in failure or warning matches this filter.{% else %}Every VPG is meeting SLA{{ ', apart from the ignored ones below' if ignored_vpgs else '' }}.{% endif %}</td></tr>{% endfor %}
+</table></div>
+
+{% if ignored_vpgs %}
+<h2 id="ignored">{{ ignored_vpgs|length }} ignored</h2>
+<details{{ ' open' if (msg and 'gnor' in msg) else '' }}><summary>Unhealthy, but an admin has ignored them — out of the counts above, alerting and SNMP failure/warning</summary>
+<div class="scroll"><table>
+  <tr><th>State</th><th>VPG</th><th>zORG</th><th>Why</th><th>Ignored</th></tr>
+  {% for v in ignored_vpgs %}
+  <tr>
+    <td><span class="tag {{ v.health }}">{{ v.health }}</span></td>
+    <td class="name"><a href="/vpgs/{{ v.key|urlencode }}">{{ v.name }}</a><div class="small">seen on {{ v.seen_on|join(', ') }}</div></td>
+    <td><a href="/zorgs/{{ (v.org or '(no zORG)')|urlencode }}">{{ v.org or '—' }}</a></td>
+    <td class="why">{{ v.why }}</td>
+    <td>{{ ig.badge(v.ignored, here, user) }}</td>
+  </tr>
+  {% endfor %}
+</table></div></details>
+{% endif %}
+{% endblock %}

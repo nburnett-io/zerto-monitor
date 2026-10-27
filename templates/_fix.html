@@ -1,0 +1,26 @@
+{# Suggested-fix cell. Import with {% import "_fix.html" as fx %}.
+   Team fixes (written by engineers) come first and say who wrote them; the researched
+   entry follows. Engineers get a form to file a new team fix under one of the row's keys. #}
+{% macro cell(fixes, keys, back, user) %}
+{% for f in fixes %}<div class="fx{{ ' team' if f.team }}">
+  {%- if f.team %}<span class="tag info" title="team fix">team</span> {% endif -%}
+  {%- if keys|length > 1 or fixes|length > 1 %}<b>{{ f.key }}:</b> {% endif -%}
+  <span class="fxt">{{ f.fix|linkify }}</span>
+  {%- if f.caution %}<span class="caution">⚠ {{ f.caution|linkify }}</span>{% endif -%}
+  {%- if f.team %}<span class="by">{{ f.by }}{% if f.at %}, {{ f.at }}{% endif %} · <a href="/playbook#k-{{ f.key|urlencode }}">edit</a></span>{% endif -%}
+</div>{% else %}<span class="small">no playbook entry yet</span>{% endfor %}
+{% if user and user.can_operate and keys %}
+<details class="ignore pbadd"><summary>+ team fix</summary>
+  <form method="post" action="/admin/playbook" class="pbform">
+    <input type="hidden" name="back" value="{{ back }}">
+    <div class="fld"><span class="fl">File under</span><select aria-label="File under" name="key">{% for k in keys %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select></div>
+    <label>What fixed it
+      <textarea name="fix" rows="3" maxlength="2000" required placeholder="Steps that worked here. {vm} {host} {datastore} {peer} {zorg} {vpg} are filled in from the alert."></textarea></label>
+    <label>Caution <span class="small">(optional)</span>
+      <input name="caution" maxlength="500" placeholder="e.g. forces a delta sync"></label>
+    <span><button type="submit">Save team fix</button></span>
+  </form>
+  <div class="small">Shown to everyone for this {{ 'alert' if keys|length == 1 else 'alert or condition' }}, ahead of the researched entry. Manage all entries on the <a href="/playbook">Playbook</a> page.</div>
+</details>
+{% endif %}
+{% endmacro %}

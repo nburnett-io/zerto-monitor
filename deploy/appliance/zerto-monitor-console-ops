@@ -1,0 +1,1394 @@
+#!/usr/bin/python3 -I
+"""Zerto Monitor appliance: the console menu's root operations.
+
+Reached only through sudo, from the menu (/usr/local/bin/zerto-monitor-console):
+
+    %zmconsole ALL=(root) NOPASSWD: /usr/local/sbin/zerto-monitor-console-ops
+
+It is deliberately NOT part of zerto-monitor-admin, the web app's socket-activated
+helper: a compromised web app must not be able to re-IP the box, grow its disk, reset
+passwords or apply an upgrade. The app's account (zertomon) is not in zmconsole, and its
+unit sets NoNewPrivileges, which stops sudo outright.
+
+Rules: a fixed list of verbs; every argument is validated HERE (the menu's own checks
+are a convenience, not the boundary); commands are argument lists, never a shell;
+secrets arrive on stdin only. Actions are logged to /var/log/zerto-monitor-console.log
+(root, 0600) without secrets.
+
+firstboot.py and the menu import this file (without running it) for the netplan
+validation and rendering, so those rules exist exactly once.
+"""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+try:                                    # absent on the Windows build host, which only
+    import grp                          # imports this file to test the validators
+    import pwd
+except ImportError:                     # pragma: no cover
+    grp = pwd = None
+
+OPS = "/usr/local/sbin/zerto-monitor-console-ops"
+HELPER = "/usr/local/sbin/zerto-monitor-admin"
+APP_DIR = Path("/opt/zerto-monitor")
+DB_FILE = APP_DIR / "data" / "monitor.db"
+VENV_PY = APP_DIR / "venv" / "bin" / "python"
+SVC_USER = "zertomon"
+GROUP = "zmconsole"
+NETPLAN_DIR = Path("/etc/netplan")
+NETPLAN_NAME = "99-zerto-monitor.yaml"
+BACKUP_ROOT = Path("/var/lib/zerto-monitor/netplan-backup")
+KEEP_BACKUPS = 10
+RUN_DIR = Path("/run/zerto-monitor-console")
+PENDING = RUN_DIR / "pending.json"
+WATCHDOG = "zm-netplan-rollback"
+TRY_TIMEOUT = 120
+BUNDLE = Path("/tmp/zm-update.zmupdate")          # a signed release bundle the admin copied here
+UPDATE_WORK = Path("/var/lib/zerto-monitor-update")   # zerto-monitor-update's own (root 0700)
+UPDATE_STATUS = Path("/var/lib/zerto-monitor/update-status.json")
+LOG = Path("/var/log/zerto-monitor-console.log")
+SSHD_DROPIN = Path("/etc/ssh/sshd_config.d/10-zerto-monitor.conf")
+CHRONY_DIR = Path("/etc/chrony/sources.d")
+CHRONY_FILE = CHRONY_DIR / "zerto-monitor.sources"
+OVFSTATE = Path("/var/lib/zerto-monitor/ovfenv.state")
+SAFE_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+
+SUDO_USER = ""                          # set in main() from sudo's own variables
+SUDO_UID = -1
+TERM = "linux"
+
+
+# ── validation (shared with the menu and firstboot.py) ──────────────────────
+class Invalid(ValueError):
+    """A value the operator typed is not acceptable; the message says why."""
+
+
+_LABEL = r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+HOST_RE = re.compile(rf"^{_LABEL}$")
+FQDN_RE = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(\.{_LABEL})*$")
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+TZ_RE = re.compile(r"^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}$")
+WEBUSER_RE = re.compile(r"^[A-Za-z0-9._@+-]{1,128}$")
+UNIXUSER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def split_list(s) -> list[str]:
+    if isinstance(s, (list, tuple)):
+        s = " ".join(str(x) for x in s)
+    return [x for x in re.split(r"[\s,;]+", str(s or "").strip()) if x]
+
+
+def v_hostname(s: str) -> str:
+    s = (s or "").strip()
+    if not HOST_RE.match(s):
+        raise Invalid("hostname: 1-63 letters, digits or hyphens, no dots, "
+                      "not starting or ending with a hyphen")
+    return s
+
+
+def v_fqdn(s: str, what: str = "DNS name") -> str:
+    s = (s or "").strip().rstrip(".")
+    if not FQDN_RE.match(s):
+        raise Invalid(f"{what} '{s}' is not a valid DNS name")
+    return s
+
+
+def v_ipv4(s: str, what: str) -> ipaddress.IPv4Address:
+    try:
+        return ipaddress.IPv4Address((s or "").strip())
+    except ValueError:
+        raise Invalid(f"{what}: '{s}' is not an IPv4 address") from None
+
+
+def v_prefix(s) -> int:
+    s = str(s or "").strip().lstrip("/")
+    try:                                # a length (23) or a contiguous mask (255.255.254.0)
+        n = ipaddress.IPv4Network(f"0.0.0.0/{s}").prefixlen
+    except ValueError:
+        raise Invalid(f"prefix '{s}' is neither a length (8-32) nor a contiguous "
+                      "subnet mask") from None
+    if not 8 <= n <= 32:
+        raise Invalid("the prefix length must be between 8 and 32")
+    return n
+
+
+def v_dns(items) -> list[str]:
+    out: list[str] = []
+    for x in split_list(items):
+        try:
+            a = ipaddress.ip_address(x)
+        except ValueError:
+            raise Invalid(f"DNS server '{x}' is not an IP address") from None
+        if a.is_unspecified or a.is_multicast:
+            raise Invalid(f"DNS server {a} is not usable")
+        if str(a) not in out:
+            out.append(str(a))
+    if len(out) > 3:
+        raise Invalid("at most 3 DNS servers")
+    return out
+
+
+def v_search(items) -> list[str]:
+    out: list[str] = []
+    for x in split_list(items):
+        d = v_fqdn(x, "search domain").lower()
+        if d not in out:
+            out.append(d)
+    if len(out) > 6:
+        raise Invalid("at most 6 search domains")
+    return out
+
+
+def v_mtu(s):
+    s = str(s or "").strip()
+    if not s:
+        return None
+    if not s.isdigit() or not 576 <= int(s) <= 9000:
+        raise Invalid("MTU must be a number from 576 to 9000 (blank leaves the default)")
+    return int(s)
+
+
+def v_mac(s: str) -> str:
+    s = (s or "").strip().lower().replace("-", ":")
+    if not MAC_RE.match(s):
+        raise Invalid(f"'{s}' is not a MAC address")
+    return s
+
+
+def v_ntp(items) -> list[str]:
+    out: list[str] = []
+    for x in split_list(items):
+        try:
+            ipaddress.ip_address(x)
+        except ValueError:
+            x = v_fqdn(x, "NTP server")
+        if x not in out:
+            out.append(x)
+    if not 1 <= len(out) <= 5:
+        raise Invalid("give 1 to 5 NTP servers")
+    return out
+
+
+def build_network(mode: str, *, mac: str = "", address: str = "",
+                  prefix="", gateway: str = "", dns=(), search=(), mtu="") -> dict:
+    """Validate one NIC's settings into a normalised spec, or raise Invalid.
+
+    The adapter is matched by MAC only: a driver match would also catch a hot-added
+    second vNIC and give it the same address and default route.
+    The address may carry its own prefix (192.0.2.5/24 or 192.0.2.5/255.255.255.0);
+    if it does, that wins over `prefix`."""
+    mode = (mode or "").strip().lower()
+    if mode not in ("dhcp", "static"):
+        raise Invalid("mode must be dhcp or static")
+    spec = {"mode": mode,
+            "match": {"macaddress": v_mac(mac)},
+            "address": None, "gateway": None, "dns": v_dns(dns),
+            "search": v_search(search), "mtu": v_mtu(mtu)}
+    a, g = (address or "").strip(), (gateway or "").strip()
+    if mode == "dhcp":
+        if a or g:
+            raise Invalid("an address and gateway only apply to a static configuration")
+        return spec
+    if not a:
+        raise Invalid("a static configuration needs an address (or choose DHCP)")
+    if "/" in a:
+        a, prefix = a.split("/", 1)
+    elif not str(prefix or "").strip():
+        raise Invalid("a prefix length or subnet mask is needed")
+    ip, n = v_ipv4(a, "address"), v_prefix(prefix)
+    iface = ipaddress.IPv4Interface(f"{ip}/{n}")
+    net = iface.network
+    if ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_link_local or ip.is_reserved:
+        raise Invalid(f"{ip} can't be used as the appliance's address")
+    if n <= 30 and ip in (net.network_address, net.broadcast_address):
+        raise Invalid(f"{ip} is the network or broadcast address of {net}")
+    spec["address"] = str(iface)
+    if g:
+        gw = v_ipv4(g, "gateway")
+        if gw not in net:
+            raise Invalid(f"gateway {gw} is outside {net}")
+        if gw == ip:
+            raise Invalid("the gateway can't be the appliance's own address")
+        if n <= 30 and gw in (net.network_address, net.broadcast_address):
+            raise Invalid(f"gateway {gw} is the network or broadcast address of {net}")
+        spec["gateway"] = str(gw)
+    return spec
+
+
+def render_netplan(spec: dict) -> str:
+    """netplan YAML for a build_network() spec. The adapter is matched by MAC address,
+    never by interface name, so a renamed vNIC still comes up.
+    Every value is validated first and written as a JSON string (valid YAML)."""
+    q = json.dumps
+    lines = ["# Managed by Zerto Monitor (first boot and the console menu). Every earlier",
+             "# version is kept in /var/lib/zerto-monitor/netplan-backup.",
+             "network:", "  version: 2", "  renderer: networkd", "  ethernets:",
+             "    zm-nic0:", "      match:", f"        macaddress: {q(spec['match']['macaddress'])}"]
+    if spec["mode"] == "dhcp":
+        lines.append("      dhcp4: true")
+    else:
+        lines += ["      dhcp4: false", f"      addresses: [{q(spec['address'])}]"]
+        if spec.get("gateway"):
+            lines += ["      routes:", "        - to: default", f"          via: {q(spec['gateway'])}"]
+    if spec.get("dns") or spec.get("search"):
+        lines.append("      nameservers:")
+        if spec.get("dns"):
+            lines.append("        addresses: [" + ", ".join(q(d) for d in spec["dns"]) + "]")
+        if spec.get("search"):
+            lines.append("        search: [" + ", ".join(q(s) for s in spec["search"]) + "]")
+    if spec.get("mtu"):
+        lines.append(f"      mtu: {int(spec['mtu'])}")
+    return "\n".join(lines) + "\n"
+
+
+def summary(spec: dict) -> str:
+    who = f"MAC {spec['match']['macaddress']}"
+    s = (f"DHCP on {who}" if spec["mode"] == "dhcp"
+         else f"{spec['address']} gw {spec.get('gateway') or 'none'} on {who}")
+    if spec.get("dns"):
+        s += " dns " + ",".join(spec["dns"])
+    if spec.get("search"):
+        s += " search " + ",".join(spec["search"])
+    if spec.get("mtu"):
+        s += f" mtu {spec['mtu']}"
+    return s
+
+
+# ── small helpers ──────────────────────────────────────────────────────────
+def sh(cmd, *, input: str | None = None, timeout: int = 120, env=None):
+    """Run an argument list (never a shell). stdin is a pipe, empty unless given."""
+    try:
+        return subprocess.run([str(c) for c in cmd], input=input or "", capture_output=True,
+                              text=True, timeout=timeout, env=env or SAFE_ENV)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+
+
+def tail(p, n: int = 8) -> str:
+    return "\n".join(((p.stderr or "") + (p.stdout or "")).strip().splitlines()[-n:])
+
+
+def audit(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {SUDO_USER or 'root'}: {msg}\n"
+    try:
+        fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def gib(n: int) -> str:
+    return f"{n / 2**30:.2f} GiB"
+
+
+def read_kv(path: Path) -> dict:
+    out = {}
+    try:
+        for ln in path.read_text().splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+# ── network state (read-only; the menu uses these too) ─────────────────────
+def ipv4_by_nic() -> dict[str, list[dict]]:
+    p = sh(["ip", "-j", "-4", "addr", "show"], timeout=10)
+    out: dict[str, list[dict]] = {}
+    try:
+        for i in json.loads(p.stdout or "[]"):
+            out[i.get("ifname", "")] = [
+                {"cidr": f"{a['local']}/{a['prefixlen']}", "dynamic": bool(a.get("dynamic"))}
+                for a in i.get("addr_info", []) if a.get("family") == "inet"]
+    except (ValueError, KeyError, TypeError):
+        pass
+    return out
+
+
+def list_nics() -> list[dict]:
+    """Every physical adapter: name, MAC, driver, link state, MTU, IPv4 addresses."""
+    base, out = Path("/sys/class/net"), []
+    try:
+        names = sorted(p.name for p in base.iterdir())
+    except OSError:
+        return out
+    addrs = ipv4_by_nic()
+    for n in names:
+        d = base / n
+        if n == "lo" or not (d / "device").exists():
+            continue
+
+        def rd(f, d=d):
+            try:
+                return (d / f).read_text().strip()
+            except OSError:
+                return ""
+        try:
+            drv = os.path.basename(os.readlink(d / "device" / "driver"))
+        except OSError:
+            drv = ""
+        out.append({"name": n, "mac": rd("address").lower(), "driver": drv,
+                    "state": rd("operstate") or "?", "mtu": rd("mtu"), "ipv4": addrs.get(n, [])})
+    return out
+
+
+def default_gateway() -> tuple[str, str]:
+    p = sh(["ip", "-j", "-4", "route", "show", "default"], timeout=10)
+    try:
+        for r in json.loads(p.stdout or "[]"):
+            if r.get("gateway"):
+                return r["gateway"], r.get("dev", "")
+    except (ValueError, TypeError):
+        pass
+    return "", ""
+
+
+def resolver() -> tuple[list[str], list[str]]:
+    """Upstream DNS servers and search domains (systemd-resolved's view first)."""
+    for f in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+        try:
+            text = Path(f).read_text()
+        except OSError:
+            continue
+        ns, se = [], []
+        for ln in text.splitlines():
+            parts = ln.split()
+            if len(parts) > 1 and parts[0] == "nameserver":
+                ns.append(parts[1])
+            elif len(parts) > 1 and parts[0] in ("search", "domain"):
+                se = [s for s in parts[1:] if s != "."]
+        if ns or se:
+            return ns, se
+    return [], []
+
+
+def primary_ipv4() -> str:
+    _, dev = default_gateway()
+    for n in list_nics():
+        if n["ipv4"] and (not dev or n["name"] == dev):
+            return n["ipv4"][0]["cidr"].split("/")[0]
+    return ""
+
+
+def read_pending() -> dict | None:
+    try:
+        d = json.loads(PENDING.read_text())
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+# ── netplan files: snapshot, stage, check, restore ─────────────────────────
+def precheck(files: dict[str, str]) -> str | None:
+    """`netplan generate` against just these files in a scratch root.
+    None means it parsed; otherwise netplan's complaint."""
+    with tempfile.TemporaryDirectory(prefix="zm-netplan-") as root:
+        d = Path(root, "etc", "netplan")
+        d.mkdir(parents=True)
+        for name, text in files.items():
+            (d / name).write_text(text)
+            (d / name).chmod(0o600)
+        p = sh(["netplan", "generate", "--root-dir", root], timeout=60)
+        if p.returncode == 0:
+            return None
+        msg = tail(p, 10) or "netplan generate failed"
+        if "unrecognized arguments" in msg or p.returncode == 127:
+            return None                 # no --root-dir here: the live generate still guards
+        return msg
+
+
+def snapshot_netplan() -> Path:
+    """Copy every file in /etc/netplan (active or set aside) into a dated backup."""
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    BACKUP_ROOT.chmod(0o700)
+    base = time.strftime("%Y%m%d-%H%M%S", time.gmtime())     # UTC: names sort right across TZ/DST changes
+    d, i = BACKUP_ROOT / base, 0
+    while d.exists():
+        i += 1
+        d = BACKUP_ROOT / f"{base}-{i}"
+    d.mkdir(mode=0o700)
+    n = 0
+    for f in sorted(NETPLAN_DIR.iterdir()) if NETPLAN_DIR.is_dir() else []:
+        if f.is_file() and not f.is_symlink():
+            shutil.copy2(f, d / f.name)
+            n += 1
+    copied = sum(1 for _ in d.iterdir())
+    if copied != n:
+        raise RuntimeError("could not take a complete copy of /etc/netplan; nothing changed")
+    snaps = sorted((p for p in BACKUP_ROOT.iterdir() if p.is_dir()), key=lambda p: p.name)
+    for old in snaps[:-KEEP_BACKUPS]:
+        shutil.rmtree(old, ignore_errors=True)
+    return d
+
+
+def latest_snapshot() -> Path | None:
+    if not BACKUP_ROOT.is_dir():
+        return None
+    snaps = sorted((p for p in BACKUP_ROOT.iterdir() if p.is_dir()), key=lambda p: p.name)
+    return snaps[-1] if snaps else None
+
+
+def restore_netplan(snap: Path) -> None:
+    """Make /etc/netplan exactly the snapshot again."""
+    if not snap.is_dir() or not any(f.is_file() for f in snap.iterdir()):
+        raise RuntimeError(f"backup {snap.name} is missing or empty; /etc/netplan was left as it is")
+    NETPLAN_DIR.mkdir(parents=True, exist_ok=True)
+    for f in NETPLAN_DIR.iterdir():
+        if f.is_file() or f.is_symlink():
+            f.unlink()
+    for f in snap.iterdir():
+        if f.is_file():
+            shutil.copy2(f, NETPLAN_DIR / f.name)
+
+
+def configured_adapters(nics: list[dict]) -> list[dict]:
+    """The adapters still present that our netplan file configures now (it always sets
+    IPv4: DHCP or a static address). Files written before 1.5 may match by driver."""
+    try:
+        text = (NETPLAN_DIR / NETPLAN_NAME).read_text()
+    except OSError:
+        return []
+    m = re.search(r'^\s*macaddress:\s*"?([0-9a-f:]{17})', text, re.M)
+    d = None if m else re.search(r'^\s*driver:\s*"?([\w-]+)', text, re.M)
+    return [n for n in nics if (m and n["mac"] == m.group(1)) or (d and n["driver"] == d.group(1))]
+
+
+def set_aside_others() -> None:
+    """netplan CONCATENATES sequences across files, so any other *.yaml would merge
+    into ours (two default routes, a DHCP/static hybrid). Rename them out of the glob."""
+    for f in sorted(NETPLAN_DIR.glob("*.yaml")):
+        if f.name == NETPLAN_NAME:
+            continue
+        dest, i = f.with_name(f.name + ".disabled"), 0
+        while dest.exists():
+            i += 1
+            dest = f.with_name(f"{f.name}.disabled.{i}")
+        f.rename(dest)
+
+
+def write_ours(text: str) -> None:
+    NETPLAN_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = NETPLAN_DIR / f".{NETPLAN_NAME}.new"
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)   # netplan warns if readable
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, NETPLAN_DIR / NETPLAN_NAME)
+
+
+def write_pending(d: dict) -> None:
+    RUN_DIR.mkdir(mode=0o755, exist_ok=True)
+    tmp = RUN_DIR / "pending.new"
+    tmp.write_text(json.dumps(d))
+    tmp.chmod(0o644)                    # no secrets; the menu reads it to offer "keep"
+    os.replace(tmp, PENDING)
+
+
+def clear_pending() -> None:
+    try:
+        PENDING.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def arm_watchdog(snap: str, seconds: int) -> bool:
+    """Independent of netplan try and of this process: if nothing confirms or rolls
+    back in time, systemd restores the snapshot. Survives a killed session or sudo."""
+    disarm_watchdog()
+    p = sh(["systemd-run", "--quiet", "--unit", WATCHDOG, f"--on-active={seconds}",
+            "--timer-property=AccuracySec=1s", OPS, "net-rollback-now", snap], timeout=30)
+    return p.returncode == 0
+
+
+def disarm_watchdog() -> None:
+    sh(["systemctl", "stop", f"{WATCHDOG}.timer"], timeout=30)
+    sh(["systemctl", "reset-failed", f"{WATCHDOG}.timer", f"{WATCHDOG}.service"], timeout=30)
+
+
+def refresh_motd() -> None:
+    """Keep the login banner's URL right after an address change."""
+    motd, ip = Path("/etc/motd"), primary_ipv4()
+    try:
+        text = motd.read_text()
+    except OSError:
+        return
+    new = re.sub(r"(?m)^(\s*Console\s*:\s*https://)[^/\s]+/", rf"\g<1>{ip}/", text) if ip else text
+    if new != text:
+        motd.write_text(new)
+
+
+def netplan_try() -> str:
+    """Run `netplan try` and return accepted / reverted / unknown.
+
+    netplan reads its ENTER from a private pty that this process owns, not from the
+    operator's terminal. A terminal that dies mid-way (an SSH session on an address
+    that just went away) would otherwise hang up netplan's stdin, and netplan reverts
+    at once - so nobody could reconnect on the new address and confirm. Here, the
+    operator's keys are relayed (ENTER keeps, Ctrl-C reverts now), output is mirrored
+    to the terminal while it lives, and `net-confirm` from another session is relayed
+    as an ENTER. SIGHUP and write errors are ignored, so the rollback always runs."""
+    import termios                      # Linux only; this module is imported on Windows too
+    env = dict(SAFE_ENV, PYTHONUNBUFFERED="1", TERM=TERM)
+    master, slave = os.openpty()
+    old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    tty_in, saved = (0 if os.isatty(0) else None), None
+    if tty_in is not None:
+        try:
+            saved = termios.tcgetattr(0)
+            raw = termios.tcgetattr(0)
+            raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)   # keys arrive one by one
+            raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
+            termios.tcsetattr(0, termios.TCSANOW, raw)
+        except termios.error:
+            tty_in = None
+    buf, tty_out, sent = b"", True, False
+    try:
+        p = subprocess.Popen(["netplan", "try", "--timeout", str(TRY_TIMEOUT)], stdin=slave,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                             start_new_session=True)
+        os.close(slave)
+        slave = -1
+        st = read_pending() or {}
+        st["pid"] = p.pid
+        write_pending(st)
+        out_fd, deadline = p.stdout.fileno(), time.monotonic() + TRY_TIMEOUT + 30
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                p.kill()
+                break
+            fds = [out_fd] + ([tty_in] if tty_in is not None else [])
+            ready, _, _ = select.select(fds, [], [], min(left, 1))
+            if out_fd in ready:
+                chunk = os.read(out_fd, 4096)
+                if not chunk:
+                    break
+                buf = (buf + chunk)[-65536:]
+                if tty_out:
+                    try:
+                        os.write(1, chunk)
+                    except OSError:
+                        tty_out = False
+            if tty_in is not None and tty_in in ready:
+                try:
+                    keys = os.read(tty_in, 64)
+                except OSError:
+                    keys = b""
+                if not keys:
+                    tty_in = None                       # the session is gone
+                elif b"\r" in keys or b"\n" in keys:
+                    os.write(master, b"\n")
+                elif b"\x03" in keys:
+                    os.kill(p.pid, signal.SIGINT)       # netplan try reverts on SIGINT
+            if not sent and (read_pending() or {}).get("confirmed"):
+                os.write(master, b"\n")                 # confirmed from another session
+                sent = True
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        if saved is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSANOW, saved)
+            except termios.error:
+                pass
+        for fd in (master, slave):
+            if fd >= 0:
+                os.close(fd)
+    text = buf.decode(errors="replace")
+    if "Configuration accepted" in text:
+        return "accepted"
+    if "Reverting" in text:
+        return "reverted"
+    return "unknown"
+
+
+def change_network(stage, label: str) -> int:
+    """Snapshot -> stage the files -> netplan generate -> netplan try -> keep or restore.
+    0 kept, 3 rolled back, 1 not applied."""
+    st = read_pending()
+    if st and not st.get("confirmed") and pid_alive(st.get("ops_pid")):
+        raise Invalid("another network change is still waiting for confirmation")
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)   # a dropped session must not stop us
+    snap = snapshot_netplan()
+    print(f"Current configuration saved to {snap}")
+    try:
+        stage()
+        p = sh(["netplan", "generate"], timeout=120)
+        if p.returncode != 0:
+            raise RuntimeError("netplan generate rejected the configuration:\n" + tail(p))
+    except Exception as e:                                       # noqa: BLE001
+        restore_netplan(snap)
+        sh(["netplan", "generate"], timeout=120)
+        shutil.rmtree(snap, ignore_errors=True)
+        audit(f"{label}: not applied ({str(e).splitlines()[0]})")
+        print(f"ERROR: {e}\nThe previous configuration is back in place; nothing was applied.")
+        return 1
+
+    armed = arm_watchdog(snap.name, TRY_TIMEOUT + 45)
+    write_pending({"snap": snap.name, "summary": label, "ops_pid": os.getpid(),
+                   "started": time.time(), "deadline": time.time() + TRY_TIMEOUT,
+                   "confirmed": False, "user": SUDO_USER})
+    audit(f"{label}: trying (backup {snap.name})")
+    print(f"\nApplying with 'netplan try'. Press ENTER within {TRY_TIMEOUT} seconds to KEEP the "
+          "new settings (or confirm from a new session); Ctrl-C or the timeout rolls them back.")
+    if not armed:
+        print("(warning: the systemd rollback timer could not be armed; netplan try's own "
+              "timeout still applies)")
+    outcome = netplan_try()
+    if outcome != "accepted" and (read_pending() or {}).get("confirmed"):
+        outcome = "accepted"            # confirmed from another session (net-confirm)
+
+    if outcome == "accepted":
+        disarm_watchdog()
+        clear_pending()
+        refresh_motd()
+        audit(f"{label}: kept")
+        print(f"\nKept. The previous configuration stays available as backup {snap.name}.")
+        return 0
+    restore_netplan(snap)
+    sh(["netplan", "generate"], timeout=120)
+    # always: `netplan generate` ran on the NEW files before try, so try's own revert can
+    # leave them live - apply the restored ones
+    sh(["netplan", "apply"], timeout=180)
+    disarm_watchdog()
+    clear_pending()
+    shutil.rmtree(snap, ignore_errors=True)            # identical to what is live again
+    audit(f"{label}: rolled back ({outcome})")
+    print("\nRolled back: the previous configuration is in place.")
+    return 3
+
+
+# ── verbs: network ─────────────────────────────────────────────────────────
+def cmd_net_apply(a) -> int:
+    spec = build_network(a.mode, mac=a.mac, address=a.address,
+                         gateway=a.gateway, dns=a.dns, search=a.search, mtu=a.mtu)
+    nics, mac = list_nics(), spec["match"]["macaddress"]
+    if mac not in {n["mac"] for n in nics}:
+        raise Invalid(f"no adapter here has MAC {mac}")
+    held = configured_adapters(nics)
+    if held and mac not in {n["mac"] for n in held}:
+        other = held[0]
+        raise Invalid(f"the network configuration is for {other['name']} ({other['mac']}). The "
+                      "appliance keeps ONE adapter's configuration, so this would remove "
+                      f"{other['name']}'s address and gateway. Reconfigure {other['name']} instead, "
+                      "or remove that vNIC in vCenter first.")
+    text = render_netplan(spec)
+    err = precheck({NETPLAN_NAME: text})
+    if err:
+        raise Invalid("netplan rejects this configuration:\n" + err)
+    print(text)
+
+    def stage():
+        set_aside_others()
+        write_ours(text)
+    return change_network(stage, summary(spec))
+
+
+def cmd_net_restore(a) -> int:
+    target = latest_snapshot()
+    if not target:
+        raise Invalid("no earlier configuration has been saved yet")
+    files = {f.name: f.read_text() for f in target.iterdir() if f.is_file()}
+    yamls = {k: v for k, v in files.items() if k.endswith(".yaml")}
+    if not yamls:
+        raise Invalid(f"backup {target.name} holds no active netplan file; restoring it "
+                      "would leave the appliance without a network configuration")
+    err = precheck(yamls)
+    if err:
+        raise Invalid(f"netplan rejects backup {target.name}:\n{err}")
+    print(f"Restoring backup {target.name}:")
+    for k, v in sorted(yamls.items()):
+        print(f"--- {k}\n{v.rstrip()}")
+    rc = change_network(lambda: restore_netplan(target), f"restore backup {target.name}")
+    if rc == 0:
+        shutil.rmtree(target, ignore_errors=True)      # now live; the newest backup is what we left
+    return rc
+
+
+def cmd_net_show(a) -> int:
+    for f in sorted(NETPLAN_DIR.iterdir()) if NETPLAN_DIR.is_dir() else []:
+        if not f.is_file():
+            continue
+        if f.name.endswith(".yaml"):
+            print(f"--- {f}\n{f.read_text().rstrip()}")
+        else:
+            print(f"--- {f} (set aside, not used)")
+    snaps = sorted(p.name for p in BACKUP_ROOT.iterdir() if p.is_dir()) if BACKUP_ROOT.is_dir() else []
+    print("\nSaved earlier configurations: " + (", ".join(snaps[-5:]) if snaps else "none"))
+    return 0
+
+
+def cmd_net_confirm(a) -> int:
+    st = read_pending()
+    if not st or st.get("confirmed"):
+        print("No network change is waiting for confirmation.")
+        return 2
+    st["confirmed"] = True              # the waiting process relays this to netplan as ENTER
+    write_pending(st)
+    disarm_watchdog()
+    if pid_alive(st.get("ops_pid")):
+        for _ in range(20):             # let it finish and clean up
+            time.sleep(1)
+            if not PENDING.exists():
+                break
+    else:                               # it died: make sure what's live is what's on disk
+        sh(["netplan", "apply"], timeout=180)
+        clear_pending()
+        refresh_motd()
+    audit(f"network change confirmed from another session: {st.get('summary', '')}")
+    print(f"Kept: {st.get('summary', 'the new configuration')}")
+    return 0
+
+
+def cmd_net_rollback_now(a) -> int:
+    """The systemd watchdog's verb: nobody confirmed and nothing rolled back in time."""
+    if not re.fullmatch(r"\d{8}-\d{6}(-\d+)?", a.snapshot):
+        raise Invalid("bad snapshot name")
+    snap = BACKUP_ROOT / a.snapshot
+    st = read_pending()
+    if not st or st.get("snap") != a.snapshot or st.get("confirmed") or not snap.is_dir():
+        print("nothing to roll back")
+        return 0
+    pid = st.get("pid")
+    if pid_alive(pid):
+        try:
+            os.kill(int(pid), signal.SIGINT)           # netplan try reverts on SIGINT
+            time.sleep(3)
+        except OSError:
+            pass
+    restore_netplan(snap)
+    sh(["netplan", "generate"], timeout=120)
+    sh(["netplan", "apply"], timeout=180)
+    clear_pending()
+    shutil.rmtree(snap, ignore_errors=True)
+    audit(f"watchdog rolled back an unconfirmed change: {st.get('summary', '')}")
+    print("rolled back")
+    return 0
+
+
+# ── verbs: identity and time ───────────────────────────────────────────────
+def _helper(*args, timeout=180) -> int:
+    """Reuse zerto-monitor-admin's own verbs (hostname, tls-selfsigned), run as root."""
+    p = sh([HELPER, *args], timeout=timeout)
+    print(((p.stdout or "") + (p.stderr or "")).strip())
+    return 0 if p.returncode == 0 else 1
+
+
+def cmd_hostname(a) -> int:
+    name = v_hostname(a.name)
+    rc = _helper("hostname", name)
+    audit(f"hostname {name}: {'ok' if rc == 0 else 'failed'}")
+    return rc
+
+
+def cmd_tls_selfsigned(a) -> int:
+    fqdn = v_fqdn(a.fqdn)
+    rc = _helper("tls-selfsigned", fqdn, "3650")
+    audit(f"self-signed certificate for {fqdn}: {'ok' if rc == 0 else 'failed'}")
+    return rc
+
+
+def cmd_time_ntp(a) -> int:
+    servers = v_ntp(a.servers)
+    if not CHRONY_DIR.is_dir():
+        raise Invalid("chrony isn't installed (/etc/chrony/sources.d is missing)")
+    # Ubuntu's stock sources are NTS to *.ntp.ubuntu.com (outbound 4460/tcp); on a
+    # closed network they never sync, so ours replace them (as first boot does)
+    stock = CHRONY_DIR / "ubuntu-ntp-pools.sources"
+    if stock.exists():
+        stock.rename(CHRONY_DIR / "ubuntu-ntp-pools.sources.disabled")
+    CHRONY_FILE.write_text("".join(f"server {s} iburst\n" for s in servers))
+    CHRONY_FILE.chmod(0o644)
+    if sh(["chronyc", "reload", "sources"], timeout=30).returncode != 0:
+        sh(["systemctl", "restart", "chrony"], timeout=60)
+    time.sleep(2)
+    print("NTP servers: " + ", ".join(servers) + "\n")
+    print(sh(["chronyc", "-n", "sources"], timeout=15).stdout.strip())
+    audit("ntp servers " + ",".join(servers))
+    return 0
+
+
+def cmd_time_tz(a) -> int:
+    z = (a.zone or "").strip()
+    if not TZ_RE.match(z) or z not in sh(["timedatectl", "list-timezones"], timeout=30).stdout.split():
+        raise Invalid(f"'{z}' is not a known timezone")
+    p = sh(["timedatectl", "set-timezone", z], timeout=30)
+    if p.returncode != 0:
+        print("ERROR: " + tail(p))
+        return 1
+    print(f"Timezone set to {z}. Local time is now {time.strftime('%Y-%m-%d %H:%M:%S')} "
+          "(the web app shows times in UTC or the viewer's zone).")
+    audit(f"timezone {z}")
+    return 0
+
+
+def cmd_time_sync(a) -> int:
+    sh(["chronyc", "burst", "4/4"], timeout=15)
+    time.sleep(8)
+    p = sh(["chronyc", "makestep"], timeout=15)
+    print((p.stdout or p.stderr).strip() + "\n")
+    print(sh(["chronyc", "-n", "tracking"], timeout=15).stdout.strip())
+    audit("time sync requested")
+    return 0
+
+
+# ── verbs: disk ────────────────────────────────────────────────────────────
+def _sectors(name: str, f: str = "size") -> int:
+    return int((Path("/sys/class/block") / name / f).read_text().strip())
+
+
+def root_device() -> dict:
+    src = sh(["findmnt", "-n", "-o", "SOURCE", "/"]).stdout.strip()
+    fstype = sh(["findmnt", "-n", "-o", "FSTYPE", "/"]).stdout.strip()
+    if not src.startswith("/dev/"):
+        raise Invalid(f"the root filesystem is on '{src}', which this tool can't grow")
+    part = os.path.basename(os.path.realpath(src))
+    sysp = Path("/sys/class/block") / part
+    if not (sysp / "partition").exists():
+        raise Invalid(f"{src} is not a plain partition (LVM, RAID or a whole disk); grow it by hand")
+    return {"src": src, "fstype": fstype, "part": part,
+            "num": int((sysp / "partition").read_text()),
+            "disk": Path(os.path.realpath(sysp)).parent.name}
+
+
+def _fs_bytes(d: dict) -> int:
+    if d["fstype"].startswith("ext"):
+        info = read_kv_colon(sh(["dumpe2fs", "-h", d["src"]], timeout=30).stdout)
+        try:
+            return int(info["Block count"]) * int(info["Block size"])
+        except (KeyError, ValueError):
+            pass
+    sv = os.statvfs("/")
+    return sv.f_blocks * sv.f_frsize
+
+
+def read_kv_colon(text: str) -> dict:
+    out = {}
+    for ln in text.splitlines():
+        k, sep, v = ln.partition(":")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def disk_facts(d: dict) -> dict:
+    disk_s, start, size = _sectors(d["disk"]), _sectors(d["part"], "start"), _sectors(d["part"])
+    later = []
+    for p in (Path("/sys/class/block") / d["disk"]).iterdir():
+        if (p / "partition").exists() and p.name != d["part"]:
+            if _sectors(p.name, "start") > start:
+                later.append(p.name)
+    tail_s = max(0, disk_s - (start + size) - 34)       # GPT keeps a backup header at the end
+    return {"disk": disk_s * 512, "part": size * 512, "fs": _fs_bytes(d),
+            "free": tail_s * 512, "last": not later}
+
+
+def rescan(disk: str) -> bool:
+    f = Path("/sys/class/block") / disk / "device" / "rescan"
+    if not f.exists():
+        return False
+    f.write_text("1")
+    time.sleep(2)
+    return True
+
+
+def _disk_table(d: dict, f: dict) -> str:
+    return (f"Root filesystem  {d['src']} ({d['fstype']}), partition {d['num']} of /dev/{d['disk']}\n"
+            f"Virtual disk     {gib(f['disk'])}\n"
+            f"Root partition   {gib(f['part'])}\n"
+            f"Filesystem       {gib(f['fs'])}\n"
+            f"Unallocated      {gib(f['free'])} after the root partition")
+
+
+def _growable(f: dict) -> bool:
+    return f["last"] and (f["free"] >= 16 * 2**20 or f["part"] - f["fs"] >= 64 * 2**20)
+
+
+def cmd_disk_info(a) -> int:
+    d = root_device()
+    scanned = rescan(d["disk"])
+    f = disk_facts(d)
+    print(("Rescanned the SCSI device.\n" if scanned else "No SCSI rescan available for this disk.\n")
+          + _disk_table(d, f))
+    if not f["last"]:
+        print("\nThe root partition is not the last one on the disk, so it can't grow in place.")
+        return 2
+    return 0 if _growable(f) else 2
+
+
+def cmd_disk_grow(a) -> int:
+    d = root_device()
+    rescan(d["disk"])
+    before = disk_facts(d)
+    if not _growable(before):
+        print(_disk_table(d, before) + "\n\nNothing to grow: enlarge the disk in vCenter first.")
+        return 2
+    if before["free"] >= 2**20:
+        if not shutil.which("growpart", path=SAFE_ENV["PATH"]):
+            raise Invalid("growpart is missing (package cloud-guest-utils; firstboot.py --upgrade installs it)")
+        p = sh(["growpart", f"/dev/{d['disk']}", str(d["num"])], timeout=300)
+        if p.returncode != 0 and "NOCHANGE" not in (p.stdout + p.stderr):
+            print("ERROR: growpart failed:\n" + tail(p))
+            audit("disk grow: growpart failed")
+            return 1
+        print((p.stdout or "").strip())
+    fs = d["fstype"]
+    cmd = (["resize2fs", d["src"]] if fs.startswith("ext") else
+           ["xfs_growfs", "/"] if fs == "xfs" else
+           ["btrfs", "filesystem", "resize", "max", "/"] if fs == "btrfs" else None)
+    if not cmd:
+        raise Invalid(f"don't know how to grow a {fs} filesystem")
+    p = sh(cmd, timeout=900)
+    if p.returncode != 0:
+        print("ERROR: filesystem resize failed:\n" + tail(p))
+        audit("disk grow: filesystem resize failed")
+        return 1
+    after = disk_facts(d)
+    print("\n                 before        after")
+    for k, lbl in (("disk", "Virtual disk"), ("part", "Root partition"), ("fs", "Filesystem")):
+        print(f"{lbl:<16} {gib(before[k]):>12}  {gib(after[k]):>12}")
+    du = shutil.disk_usage("/")
+    print(f"\n/ now has {gib(du.free)} free of {gib(du.total)}.")
+    audit(f"disk grown: filesystem {gib(before['fs'])} -> {gib(after['fs'])}")
+    return 0
+
+
+# ── verbs: services, logs, upgrade ─────────────────────────────────────────
+def cmd_svc_restart(a) -> int:
+    if a.unit == "nginx":
+        t = sh(["nginx", "-t"], timeout=30)
+        if t.returncode != 0:
+            print("ERROR: nginx's configuration test fails, so it was not restarted:\n" + tail(t))
+            return 1
+    p = sh(["systemctl", "restart", a.unit], timeout=120)
+    time.sleep(2)
+    state = sh(["systemctl", "is-active", a.unit], timeout=15).stdout.strip()
+    print(f"{a.unit}: {state}" + ("" if p.returncode == 0 else "\n" + tail(p)))
+    audit(f"restart {a.unit}: {state}")
+    return 0 if state == "active" else 1
+
+
+def cmd_logs(a) -> int:
+    if a.which == "app":
+        p = sh(["journalctl", "-u", "zerto-monitor", "-n", "200", "--no-pager", "-o", "short-iso"], timeout=60)
+        print(p.stdout.rstrip() or "(no journal entries)")
+    else:
+        try:
+            lines = Path("/var/log/nginx/error.log").read_text(errors="replace").splitlines()[-200:]
+            print("\n".join(lines) or "(the nginx error log is empty)")
+        except OSError as e:
+            print(f"(cannot read /var/log/nginx/error.log: {e.strerror})")
+    return 0
+
+
+def stage_bundle() -> None:
+    """Hand /tmp/zm-update.zmupdate to the signed updater, checked like the web app's
+    update-start: a regular file (not a link), yours or root's, not writable by others,
+    copied root-private so it can't be swapped afterwards. The updater verifies it."""
+    try:
+        fd = os.open(BUNDLE, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise Invalid(f"no update at {BUNDLE}; copy the release's .zmupdate there first") from None
+    except OSError as e:
+        raise Invalid(f"can't open {BUNDLE} ({e.strerror}); it must be a plain file, not a link") from None
+    with os.fdopen(fd, "rb") as src:
+        st = os.fstat(src.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise Invalid(f"{BUNDLE} is not a regular file")
+        if st.st_uid not in (0, SUDO_UID):
+            raise Invalid(f"{BUNDLE} belongs to uid {st.st_uid}; it must be yours or root's")
+        if st.st_mode & 0o022:
+            raise Invalid(f"{BUNDLE} is writable by other users; chmod 600 it and retry")
+        if st.st_size > 64 * 2**20:
+            raise Invalid(f"{BUNDLE} is implausibly large")
+        UPDATE_WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(UPDATE_WORK, 0o700)
+        tmp = UPDATE_WORK / "incoming.zmupdate.new"
+        tmp.unlink(missing_ok=True)
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    os.replace(tmp, UPDATE_WORK / "incoming.zmupdate")
+
+
+def update_status() -> dict:
+    try:
+        return json.loads(UPDATE_STATUS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_upgrade(a) -> int:
+    before = (APP_DIR / "VERSION").read_text().strip() if (APP_DIR / "VERSION").exists() else "unknown"
+    if not a.repair:
+        # the same signed path as Admin > Updates: signature, downgrade refusal, backup,
+        # health check and automatic rollback all live in zerto-monitor-update
+        if sh(["systemctl", "is-active", "--quiet", "zerto-monitor-update.service"], timeout=15).returncode == 0:
+            raise Invalid("an update is already running")
+        stage_bundle()
+        req = UPDATE_WORK / "request.json"
+        req.write_text(json.dumps({"allow_downgrade": bool(a.allow_downgrade), "by": "console"}))
+        req.chmod(0o600)
+        prev = update_status()
+        audit(f"signed update handed to the updater over {before} (allow_downgrade={bool(a.allow_downgrade)})")
+        print(f"Installed: {before}. The updater checks the signature, backs up, installs, runs the "
+              "installer and health-checks; a failed check rolls back by itself. A few minutes...\n")
+        p = sh(["systemctl", "start", "zerto-monitor-update.service"], timeout=7500)   # oneshot: returns when done
+        s = update_status()
+        if s == prev:
+            print("ERROR: the updater did not run:\n" + tail(p))
+            return 1
+        print(f"Result: {s.get('state', 'unknown')} ({s.get('from_version', '?')} -> {s.get('to_version') or '?'})\n"
+              f"{s.get('detail', '')}\n\nDetail: /var/log/zerto-monitor-update.log")
+        audit(f"signed update: {s.get('state', 'unknown')}")
+        return 0 if s.get("state") == "done" else 1
+    print(f"Re-running the installer for the version on disk ({before}) ...")
+    print("Running firstboot.py --upgrade (packages, venv, helper, console, nginx, service).\n")
+    p = subprocess.run(["/usr/bin/python3", str(APP_DIR / "firstboot.py"), "--upgrade"],
+                       env=SAFE_ENV, stdin=subprocess.DEVNULL)
+    audit(f"firstboot.py --upgrade exited {p.returncode}")
+    print("\nUpgrade finished." if p.returncode == 0 else
+          "\nUpgrade finished WITH ERRORS - see /var/log/zerto-monitor-firstboot.log")
+    return 0 if p.returncode == 0 else 1
+
+
+# ── verbs: break-glass ─────────────────────────────────────────────────────
+# Runs as the service user inside the app's venv, so the -wal/-shm files stay owned
+# by zertomon. Hashes exactly like app/auth.py hash_password and updates exactly like
+# app/db.py set_password. The password arrives on stdin, inside the JSON.
+WEBDB_SCRIPT = r'''
+import json, os, sqlite3, sys
+from datetime import datetime, timezone
+os.umask(0o077)
+req = json.loads(sys.stdin.read())
+c = sqlite3.connect("/opt/zerto-monitor/data/monitor.db", timeout=30)
+try:
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA secure_delete=ON")
+    cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+    if req["op"] == "list":
+        role = "role" if "role" in cols else "CASE WHEN is_admin THEN 'admin' ELSE 'viewer' END"
+        src = "COALESCE(auth_source,'local')" if "auth_source" in cols else "'local'"
+        for r in c.execute(f"SELECT username, {role}, {src} FROM users ORDER BY username"):
+            print("\t".join(str(x) for x in r))
+        sys.exit(0)
+    import bcrypt
+    user = req["user"]
+    row = c.execute("SELECT * FROM users WHERE username=?", (user,)).fetchone()
+    if row is not None and (dict(row).get("auth_source") or "local") == "entra":
+        print("RESULT=entra"); sys.exit(4)
+    if row is None and not req.get("create"):
+        print("RESULT=nouser"); sys.exit(3)
+    hashed = bcrypt.hashpw(req.pop("password").encode(), bcrypt.gensalt()).decode()
+    with c:
+        if row is None:
+            c.execute("INSERT INTO users(username,hashed_password,role,is_admin,created_at,auth_source) "
+                      "VALUES(?,?,?,?,?,?)", (user, hashed, "admin", 1,
+                      datetime.now(timezone.utc).isoformat(timespec="seconds"), "local"))
+            print("RESULT=created")
+        else:
+            c.execute("UPDATE users SET hashed_password=? WHERE username=?", (hashed, user))
+            print("RESULT=updated")
+finally:
+    c.close()
+'''
+
+
+def webdb(req: dict) -> subprocess.CompletedProcess:
+    if not DB_FILE.exists() or not VENV_PY.exists():
+        raise Invalid("the web app isn't installed yet (no database or venv); open "
+                      "https://<appliance>/setup once it is running")
+    return sh(["runuser", "-u", SVC_USER, "--", str(VENV_PY), "-I", "-c", WEBDB_SCRIPT],
+              input=json.dumps(req), timeout=120)
+
+
+def read_secret(minlen: int, maxbytes: int, what: str) -> str:
+    pw = sys.stdin.readline()
+    pw = pw[:-1] if pw.endswith("\n") else pw
+    pw = pw[:-1] if pw.endswith("\r") else pw
+    if "\0" in pw or "\n" in pw:
+        raise Invalid(f"the {what} contains a character that isn't allowed")
+    if len(pw) < minlen:
+        raise Invalid(f"the {what} must be at least {minlen} characters")
+    if len(pw.encode()) > maxbytes:
+        raise Invalid(f"the {what} must be at most {maxbytes} bytes")
+    return pw
+
+
+def cmd_web_users(a) -> int:
+    p = webdb({"op": "list"})
+    if p.returncode != 0:
+        last = ((p.stderr or "").strip().splitlines() or ["unknown error"])[-1]
+        print(f"ERROR: could not read the users table: {last}")
+        return 1
+    print(p.stdout.rstrip())
+    return 0
+
+
+def cmd_web_password(a) -> int:
+    user = (a.user or "").strip()
+    if not WEBUSER_RE.match(user):
+        raise Invalid("user names are 1-128 letters, digits and . _ @ + -")
+    pw = read_secret(10, 72, "web password")              # the app's rule; bcrypt's limit
+    p = webdb({"op": "set", "user": user, "password": pw, "create": bool(a.create)})
+    del pw
+    result = next((ln.split("=", 1)[1] for ln in (p.stdout or "").splitlines()
+                   if ln.startswith("RESULT=")), "")
+    if result == "entra":
+        raise Invalid(f"'{user}' signs in with Entra ID and has no local password; "
+                      "create a separate local admin instead")
+    if result == "nouser":
+        raise Invalid(f"there is no web user '{user}'")
+    if p.returncode != 0 or result not in ("created", "updated"):
+        print("ERROR: the password was not changed (database error)")
+        audit(f"web password for {user}: failed")
+        return 1
+    audit(f"web password for {user}: {result}")
+    print(f"OK: {'created local admin' if result == 'created' else 'new password set for'} '{user}'. "
+          "Sessions already signed in stay signed in until they expire.")
+    return 0
+
+
+def cmd_os_password(a) -> int:
+    user = SUDO_USER
+    if not user or not UNIXUSER_RE.match(user):
+        raise Invalid("run this from the console menu as the admin account (through sudo)")
+    try:
+        members = grp.getgrnam(GROUP).gr_mem
+        uid = pwd.getpwnam(user).pw_uid
+    except (KeyError, AttributeError):
+        raise Invalid(f"'{user}' is not a console admin") from None
+    if user not in members or uid < 1000:
+        raise Invalid(f"'{user}' is not a console admin")
+    pw = read_secret(8, 128, "password")
+    p = sh(["chpasswd"], input=f"{user}:{pw}\n", timeout=30)
+    del pw
+    if p.returncode != 0:
+        print("ERROR: chpasswd refused the password")
+        audit(f"linux password for {user}: failed")
+        return 1
+    sh(["chage", "-M", "99999", "-d", "today", user], timeout=30)
+    audit(f"linux password for {user}: set")
+    print(f"OK: password set for {user}. It works for the VM console, sudo, and SSH "
+          "if SSH password sign-in is on.")
+    return 0
+
+
+def sshd_effective() -> dict:
+    Path("/run/sshd").mkdir(mode=0o755, exist_ok=True)      # sshd -T/-t need it
+    out = {}
+    for ln in sh(["sshd", "-T"], timeout=30).stdout.splitlines():
+        k, _, v = ln.partition(" ")
+        out[k.lower()] = v
+    return out
+
+
+def cmd_ssh_password(a) -> int:
+    if a.state == "status":
+        print("PasswordAuthentication=" + sshd_effective().get("passwordauthentication", "unknown"))
+        return 0
+    want = "yes" if a.state == "on" else "no"
+    prev = SSHD_DROPIN.read_text() if SSHD_DROPIN.exists() else None
+    SSHD_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+    # sorts before cloud-init's 50- and the image's 60- drop-ins: sshd keeps the FIRST value
+    SSHD_DROPIN.write_text(f"PasswordAuthentication {want}\nPermitRootLogin prohibit-password\n")
+    SSHD_DROPIN.chmod(0o600)
+    Path("/run/sshd").mkdir(mode=0o755, exist_ok=True)
+    t = sh(["sshd", "-t"], timeout=30)
+    if t.returncode != 0:
+        if prev is None:
+            SSHD_DROPIN.unlink()
+        else:
+            SSHD_DROPIN.write_text(prev)
+        print("ERROR: sshd rejected the change; nothing was changed:\n" + tail(t))
+        return 1
+    sh(["systemctl", "try-reload-or-restart", "ssh.service"], timeout=60)
+    eff = sshd_effective().get("passwordauthentication", "unknown")
+    audit(f"ssh password authentication {want} (effective {eff})")
+    print(f"SSH password sign-in is now {'ON' if eff == 'yes' else 'OFF' if eff == 'no' else eff}. "
+          "Sessions already open are not affected.")
+    return 0 if eff == want else 1
+
+
+def _pw_status(user: str) -> str:
+    parts = sh(["passwd", "-S", user], timeout=15).stdout.split()
+    return {"L": "locked (no password sign-in)", "P": "password set",
+            "NP": "NO PASSWORD (empty)"}.get(parts[1] if len(parts) > 1 else "", "unknown")
+
+
+def cmd_posture(a) -> int:
+    L = []
+    st = read_kv(OVFSTATE)
+    held = [h for h in st.get("held", "").split(",") if h]
+    L.append("vApp properties in vCenter")
+    if not st:
+        L.append("  unknown: zerto-monitor-ovfscrub has not recorded a check yet")
+    elif held:
+        L += [f"  STILL HOLDS: {', '.join(held)}",
+              "  -> vCenter: Edit Settings > vApp Options > Properties, blank them,",
+              "     then change those passwords (they were readable there since deploy)"]
+    else:
+        L.append("  no deploy-time passwords held")
+    L.append(f"  guest copy: {st.get('guest', '?')}, last checked {st.get('checked', '?')}")
+    L.append(f"  cloud-init: {'disabled' if Path('/etc/cloud/cloud-init.disabled').exists() else 'ENABLED'}; "
+             f"scrub timer: {sh(['systemctl', 'is-active', 'zerto-monitor-ovfscrub.timer']).stdout.strip() or '?'}")
+    eff = sshd_effective()
+    L += ["", "Accounts and SSH",
+          f"  SSH password sign-in: {eff.get('passwordauthentication', '?')}; "
+          f"root over SSH: {eff.get('permitrootlogin', '?')}",
+          f"  root: {_pw_status('root')}"]
+    members = []
+    try:
+        members = sorted(grp.getgrnam(GROUP).gr_mem)
+    except (KeyError, AttributeError):
+        pass
+    for u in members:
+        try:
+            ak = Path(pwd.getpwnam(u).pw_dir) / ".ssh" / "authorized_keys"
+            keys = sum(1 for ln in ak.read_text().splitlines() if ln.strip() and not ln.startswith("#"))
+        except (OSError, KeyError):
+            keys = 0
+        L.append(f"  {u}: {_pw_status(u)}, {keys} SSH key(s)")
+    L.append(f"  sudo: {GROUP} members ({', '.join(members) or 'none'}) may run ONLY the console's")
+    L.append("        root operations without a password; full sudo still needs the password")
+    L += ["", "Secrets on disk"]
+    for f in (Path("/etc/zerto-monitor/fernet.key"), Path("/etc/zerto-monitor/session.key"),
+              Path("/etc/zerto-monitor/tls/privkey.pem")):
+        try:
+            s = f.stat()
+            ok = s.st_uid == 0 and (s.st_mode & 0o077) == 0
+            L.append(f"  {f.name:<12} {'root-only 0600' if ok else 'WRONG: mode ' + oct(s.st_mode & 0o777)}")
+        except OSError:
+            L.append(f"  {f.name:<12} missing")
+    cert = sh(["openssl", "x509", "-in", "/etc/zerto-monitor/tls/fullchain.pem", "-noout",
+               "-subject", "-issuer", "-enddate"], timeout=15).stdout
+    info = {k: v for k, _, v in (ln.partition("=") for ln in cert.splitlines())}
+    if info:
+        kind = "self-signed" if info.get("subject") == info.get("issuer") else "CA-issued"
+        L.append(f"  web certificate: {kind}, expires {info.get('notAfter', '?')}")
+    L += ["", "Services",
+          f"  snmpd: {sh(['systemctl', 'is-active', 'snmpd']).stdout.strip() or '?'} "
+          "(SNMP v2c communities travel in clear; keep it on the management network)",
+          f"  apport crash dumps: {sh(['systemctl', 'is-enabled', 'apport.service']).stdout.strip() or 'absent'}"]
+    print("\n".join(L))
+    return 0
+
+
+def cmd_power(a) -> int:
+    audit(f"power {a.action}")
+    print("Rebooting..." if a.action == "reboot" else "Shutting down...")
+    sh(["systemctl", a.action], timeout=60)
+    return 0
+
+
+VERBS = {
+    "net-apply": cmd_net_apply, "net-restore": cmd_net_restore, "net-show": cmd_net_show,
+    "net-confirm": cmd_net_confirm, "net-rollback-now": cmd_net_rollback_now,
+    "hostname": cmd_hostname, "tls-selfsigned": cmd_tls_selfsigned,
+    "time-ntp": cmd_time_ntp, "time-tz": cmd_time_tz, "time-sync": cmd_time_sync,
+    "disk-info": cmd_disk_info, "disk-grow": cmd_disk_grow,
+    "svc-restart": cmd_svc_restart, "logs": cmd_logs, "upgrade": cmd_upgrade,
+    "web-users": cmd_web_users, "web-password": cmd_web_password,
+    "os-password": cmd_os_password, "ssh-password": cmd_ssh_password,
+    "posture": cmd_posture, "power": cmd_power,
+}
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="zerto-monitor-console-ops", allow_abbrev=False,
+                                description="Root operations for the Zerto Monitor console menu.")
+    s = p.add_subparsers(dest="verb", required=True, metavar="VERB")
+
+    def add(name, *args):
+        sp = s.add_parser(name, allow_abbrev=False)
+        for a in args:
+            sp.add_argument(*a[0], **a[1])
+        return sp
+    n = add("net-apply", (["--mode"], {"required": True, "choices": ("dhcp", "static")}),
+            (["--address"], {"default": ""}), (["--gateway"], {"default": ""}),
+            (["--dns"], {"default": ""}), (["--search"], {"default": ""}), (["--mtu"], {"default": ""}))
+    n.add_argument("--mac", required=True)
+    for name in ("net-show", "net-restore", "net-confirm", "time-sync", "disk-info", "disk-grow",
+                 "web-users", "os-password", "posture"):
+        add(name)
+    add("net-rollback-now", (["snapshot"], {}))
+    add("hostname", (["name"], {}))
+    add("tls-selfsigned", (["fqdn"], {}))
+    add("time-ntp", (["servers"], {"nargs": "+"}))
+    add("time-tz", (["zone"], {}))
+    add("svc-restart", (["unit"], {"choices": ("zerto-monitor", "nginx")}))
+    add("logs", (["which"], {"choices": ("app", "nginx")}))
+    add("upgrade", (["--repair"], {"action": "store_true"}), (["--allow-downgrade"], {"action": "store_true"}))
+    add("web-password", (["user"], {}), (["--create"], {"action": "store_true"}))
+    add("ssh-password", (["state"], {"choices": ("on", "off", "status")}))
+    add("power", (["action"], {"choices": ("reboot", "poweroff")}))
+    return p
+
+
+def main(argv=None) -> int:
+    global SUDO_USER, SUDO_UID, TERM
+    if os.geteuid() != 0:
+        print("ERROR: run this through sudo, from the console menu (zerto-monitor-console)")
+        return 1
+    u = os.environ.get("SUDO_USER", "")
+    SUDO_USER = u if UNIXUSER_RE.match(u) else ""
+    try:
+        SUDO_UID = int(os.environ.get("SUDO_UID", "-1"))
+    except ValueError:
+        SUDO_UID = -1
+    t = os.environ.get("TERM", "")
+    TERM = t if re.fullmatch(r"[A-Za-z0-9._+-]{1,40}", t) else "linux"
+    os.environ.clear()                  # nothing from the caller's environment past here
+    os.environ.update(SAFE_ENV)
+    os.umask(0o022)
+    os.chdir("/")
+    a = parser().parse_args(argv)
+    try:
+        return VERBS[a.verb](a) or 0
+    except Invalid as e:
+        print(f"ERROR: {e}")
+        audit(f"{a.verb}: refused ({str(e).splitlines()[0]})")
+        return 2
+    except Exception as e:                                       # noqa: BLE001
+        print(f"ERROR: {e}")
+        audit(f"{a.verb}: failed ({str(e).splitlines()[0] if str(e) else type(e).__name__})")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

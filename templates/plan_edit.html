@@ -1,0 +1,63 @@
+{% extends "base.html" %}{% block title %}{{ name }} recovery plan · Zerto Monitor{% endblock %}
+{% block body %}
+<p class="small"><a href="/zorgs/{{ name|urlencode }}#plans">← {{ name }}</a></p>
+<h1>{{ 'Edit' if existing else 'New' }} DR failover plan — {{ name }}</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<p class="small">A Zerto recovery plan runs its blocks in order when a failover (or failover test) of the plan is started. Put the VPGs that must
+  come up first in tier 1 - typically domain controllers and DNS - then databases, then applications, then everything else. After each tier
+  the plan can <b>wait</b> until that tier's recovery has finished, run a <b>script</b> from the ZVM's script repository, and <b>pause</b> for
+  some minutes. The plan is kept on the ZVM of the site the VPGs recover to. Saving it changes nothing that's running.</p>
+
+<form method="get" class="formrow" style="max-width:40rem">
+  <div class="fld"><span class="fl">Recovery site</span><select aria-label="Recovery site" name="site" onchange="this.form.submit()">{% for s in sites %}<option value="{{ s.site }}" {{ 'selected' if s.site == site }}>{{ s.site }} ({{ s.vpgs }} VPGs{{ ', not monitored' if not s.monitored }})</option>{% endfor %}</select></div>
+</form>
+
+{% if arming %}<div class="note"><b>Can't be saved to Zerto yet:</b> {{ arming|join('; ') }}. You can still lay the plan out and preview it.</div>{% endif %}
+
+{% if vpgs %}
+<form method="post" action="/zorgs/{{ name|urlencode }}/plan">
+  <input type="hidden" name="site" value="{{ site }}">{% if plan_id %}<input type="hidden" name="plan_id" value="{{ plan_id }}">{% endif %}
+  <div class="formrow" style="max-width:52rem">
+    <label>Plan name<input name="name" maxlength="100" required value="{{ form.name or '' }}"></label>
+    <div class="fld"><span class="fl">Type</span><select aria-label="Type" name="type">{% for t in ('Standard', 'Cyber') %}<option {{ 'selected' if form.type == t }}>{{ t }}</option>{% endfor %}</select></div>
+  </div>
+  <div class="sub">VPGs → tiers <span class="small">(blank = left out of the plan)</span></div>
+  <div class="scroll tiers"><table>
+    <tr><th>Tier</th><th>VPG</th><th class="num">VMs</th><th>Priority</th><th>State</th><th class="c2">Last test</th></tr>
+    {% for v in vpgs|sort(attribute='name') %}
+    <tr><td><input type="number" name="tier_{{ v.id }}" min="1" max="{{ max_tiers }}" value="{{ form.get('tier_' ~ v.id, '') }}" aria-label="tier for {{ v.name }}"></td>
+      <td class="name">{{ v.name }}</td><td class="num">{{ v.vms }}</td><td class="small">{{ v.priority }}</td>
+      <td><span class="tag {{ v.health }}">{{ v.health }}</span></td><td class="small c2">{{ (v.last_test or 'never')[:10] }}</td></tr>
+    {% endfor %}
+  </table></div>
+  <div class="sub">After each tier</div>
+  <div class="scroll tiers"><table>
+    <tr><th>Tier</th><th>Wait for it to finish</th><th>Then run script <span class="small">(path in the ZVM's repository)</span></th><th>Script parameters</th><th>Then pause (min)</th></tr>
+    {% for n in range(1, max_tiers + 1) %}
+    <tr><td class="num">{{ n }}</td>
+      <td><input type="checkbox" name="wait_{{ n }}" value="1" {{ 'checked' if form.get('wait_' ~ n) == '1' }}></td>
+      <td><input name="script_{{ n }}" value="{{ form.get('script_' ~ n, '') }}" maxlength="200" style="width:100%"></td>
+      <td><input name="params_{{ n }}" value="{{ form.get('params_' ~ n, '') }}" maxlength="500" style="width:100%" placeholder="space-separated"></td>
+      <td><input type="number" name="delay_{{ n }}" min="0" max="240" value="{{ form.get('delay_' ~ n, '') }}"></td></tr>
+    {% endfor %}
+  </table></div>
+  <p class="small">Unused tiers are ignored. Script parameters are stored in Zerto's plan in clear - never put a password in them.</p>
+  <button type="submit" name="action" value="preview" class="ghost">Preview</button>
+  {% if not arming %}<button type="submit" name="action" value="save">{{ 'Save changes to Zerto' if existing else 'Create the plan in Zerto' }}</button>{% endif %}
+</form>
+{% else %}<p class="small">None of {{ name }}'s VPGs recover to {{ site or 'a monitored site' }}.</p>{% endif %}
+
+{% if submitted %}
+<h2>Preview</h2>
+{% if problems %}<div class="err">{% for p in problems %}<div>{{ p }}</div>{% endfor %}</div>{% endif %}
+{% if tiers %}
+<div class="planbox"><b>{{ form.name }}</b> <span class="small">({{ form.type }}, at {{ site }})</span>
+  <ol>{% for t in tiers %}<li><b>Tier {{ t.n }}</b>: {% for vid in t.vpg_ids %}{{ (vpgs|selectattr('id', 'equalto', vid)|first).name }}{{ ', ' if not loop.last }}{% endfor %}
+    {% if t.wait %}<span class="small"> → wait until recovered</span>{% endif %}{% if t.script %}<span class="small"> → script {{ t.script }}</span>{% endif %}{% if t.delay %}<span class="small"> → pause {{ t.delay }} min</span>{% endif %}</li>{% endfor %}</ol>
+  {% set left = vpgs|rejectattr('id', 'in', tiers|map(attribute='vpg_ids')|sum(start=[]))|list %}
+  {% if left %}<div class="small" style="color:var(--warn)">Not in the plan: {{ left|map(attribute='name')|join(', ') }} - a failover of this plan would leave {{ 'it' if left|length == 1 else 'them' }} behind.</div>{% endif %}
+</div>
+{% if body %}<details><summary>request body</summary><pre>{{ body|tojson(indent=2) }}</pre></details>{% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}

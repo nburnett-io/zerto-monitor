@@ -1,0 +1,907 @@
+#!/usr/bin/python3
+"""Zerto Monitor appliance console menu (in the spirit of vCenter's DCUI).
+
+Opens at login, on the VM console and over SSH, for members of 'zmconsole' (see
+/etc/profile.d/zz-zerto-monitor-console.sh). Run 'zerto-monitor-console' to reopen it.
+It is a convenience, not a jail: "Shell" (or Esc on the main menu) gives the normal
+bash prompt, with exactly the rights the account had anyway.
+
+Runs as the signed-in admin with the system python3 and whiptail. Anything that needs
+root goes through  sudo -n /usr/local/sbin/zerto-monitor-console-ops <verb> <args>,
+which validates everything again. Passwords are read with whiptail --passwordbox (the
+answer comes back on a private pipe, never argv) and reach sudo on stdin only.
+"""
+from __future__ import annotations
+
+import http.client
+import importlib.util
+import ipaddress
+import os
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+from importlib.machinery import SourceFileLoader
+
+OPS = "/usr/local/sbin/zerto-monitor-console-ops"
+SUDO = "/usr/bin/sudo"
+WHIPTAIL = "/usr/bin/whiptail"
+APP_DIR = "/opt/zerto-monitor"
+CERT = "/etc/zerto-monitor/tls/fullchain.pem"
+BUNDLE = "/tmp/zm-update.zmupdate"
+CHRONY_FILE = "/etc/chrony/sources.d/zerto-monitor.sources"
+LOGOUT = 10                             # exit code the login hook turns into a logout
+SUDO_HINT = ("\n\nThis account can't run the console's root operations. It must be in the "
+             "'zmconsole' group (then sign in again), and /etc/sudoers.d/zerto-monitor-console "
+             "must exist: 'firstboot.py --upgrade' installs both.")
+Z = None                                # the ops module: shared validators and readers
+LAST: dict = {}
+
+
+def load_ops():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (OPS, os.path.join(here, "zerto-monitor-console-ops")):
+        if os.path.isfile(path):
+            loader = SourceFileLoader("zm_console_ops", path)
+            mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError(f"{OPS} is missing")
+
+
+def out(cmd, timeout: int = 10) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# ── whiptail ────────────────────────────────────────────────────────────────
+class UI:
+    def __init__(self, back: str):
+        self.back = back
+
+    @staticmethod
+    def dims() -> tuple[int, int]:
+        c, r = shutil.get_terminal_size((80, 24))
+        return max(r, 12), max(c, 40)
+
+    def _box(self, args: list[str], title: str) -> tuple[int, str]:
+        """Run whiptail on the terminal; its answer comes back on a private pipe."""
+        rfd, wfd = os.pipe()
+        try:
+            rc = subprocess.run([WHIPTAIL, "--backtitle", self.back, "--title", f" {title} ",
+                                 "--output-fd", str(wfd), *args], pass_fds=(wfd,)).returncode
+        finally:
+            os.close(wfd)
+        with os.fdopen(rfd, encoding="utf-8", errors="replace") as f:
+            return rc, f.read()
+
+    def _fit(self, text: str, extra: int = 0) -> tuple[int, int, bool]:
+        rows, cols = self.dims()
+        lines = text.splitlines() or [""]
+        w = min(cols - 4, max(60, min(110, max(len(ln) for ln in lines) + 6)))
+        n = sum(max(1, -(-len(ln) // max(1, w - 4))) for ln in lines)
+        h = min(rows - 2, n + 7 + extra)
+        return h, w, n + 7 + extra > rows - 2
+
+    def msg(self, text: str, title: str = "") -> None:
+        h, w, scroll = self._fit(text)
+        self._box((["--scrolltext"] if scroll else []) + ["--msgbox", text, str(h), str(w)], title)
+
+    def yesno(self, text: str, title: str = "", default_no: bool = False,
+              yes: str = "Yes", no: str = "No") -> bool:
+        h, w, scroll = self._fit(text)
+        args = ["--yes-button", yes, "--no-button", no] + (["--defaultno"] if default_no else [])
+        args += (["--scrolltext"] if scroll else []) + ["--yesno", text, str(h), str(w)]
+        return self._box(args, title)[0] == 0
+
+    def menu(self, text: str, items: list[tuple[str, str]], title: str = "",
+             default: str | None = None, cancel: str = "Back") -> str | None:
+        rows, cols = self.dims()
+        tl = len(text.splitlines()) or 1
+        lh = max(3, min(len(items), rows - 9 - tl))
+        h = min(rows - 2, lh + tl + 8)
+        w = min(cols - 4, max(60, max(len(t) + len(d) for t, d in items) + 12,
+                              max(len(ln) for ln in (text.splitlines() or [""])) + 6))
+        flat = [x for t, d in items for x in (t, d or " ")]
+        args = ["--ok-button", "Select", "--cancel-button", cancel]
+        args += (["--default-item", default] if default else [])
+        args += ["--menu", text, str(h), str(w), str(lh), *flat]
+        rc, val = self._box(args, title)
+        return val.strip() if rc == 0 else None
+
+    def input(self, text: str, init: str = "", title: str = "") -> str | None:
+        h, w, _ = self._fit(text, 2)
+        rc, val = self._box(["--inputbox", text, str(h), str(w), init], title)
+        return val.strip() if rc == 0 else None
+
+    def password(self, text: str, title: str = "") -> str | None:
+        h, w, _ = self._fit(text, 2)
+        rc, val = self._box(["--passwordbox", text, str(h), str(w)], title)
+        return val.rstrip("\n") if rc == 0 else None
+
+    def info(self, text: str, title: str = "") -> None:
+        h, w, _ = self._fit(text)
+        self._box(["--infobox", text, str(h), str(w)], title)
+
+    def view(self, text: str, title: str) -> None:
+        """Long output (logs) in a scrollable textbox, via a private temp file."""
+        d = tempfile.mkdtemp(prefix="zm-console-")
+        try:
+            path = os.path.join(d, "view.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            rows, cols = self.dims()
+            self._box(["--scrolltext", "--textbox", path, str(rows - 2), str(cols - 4)], title)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def ask(ui: UI, text: str, init: str, check, title: str):
+    """Input box that loops until `check` accepts the value (returns its result) or Cancel."""
+    val = init
+    while True:
+        val = ui.input(text, val, title)
+        if val is None:
+            return None
+        try:
+            return check(val)
+        except Z.Invalid as e:
+            ui.msg(str(e), "Not valid")
+
+
+# ── root operations ─────────────────────────────────────────────────────────
+def ops_argv(*args) -> list[str]:
+    return ([OPS] if os.geteuid() == 0 else [SUDO, "-n", OPS]) + [str(a) for a in args]
+
+
+def ops(*args, secret: str | None = None, timeout: int = 600) -> tuple[int, str]:
+    """Run one root operation and capture its output. A secret goes on stdin, and is
+    masked out of whatever comes back."""
+    try:
+        p = subprocess.run(ops_argv(*args), input=(secret + "\n") if secret is not None else "",
+                           capture_output=True, text=True, timeout=timeout)
+        rc, text = p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        rc, text = 124, "timed out"
+    except OSError as e:
+        rc, text = 127, str(e)
+    if secret:
+        text = text.replace(secret, "********")
+    low = text.lower()
+    if rc and "sudo" in low and ("password" in low or "not allowed" in low or "may not" in low):
+        text += SUDO_HINT
+    return rc, text or ("done" if rc == 0 else f"failed (exit {rc})")
+
+
+def pause() -> None:
+    try:
+        input("\nPress Enter to return to the menu...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def on_terminal(title: str, args: list[str], intro: str = "") -> int:
+    """Long or interactive operations (netplan try, upgrades) run on the plain terminal."""
+    print("\033[H\033[2J", end="")
+    print(f"=== {title} ===\n")
+    if intro:
+        print(intro + "\n")
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)     # the operation decides about Ctrl-C
+    try:
+        rc = subprocess.run(ops_argv(*args)).returncode
+    except OSError as e:
+        print(e)
+        rc = 127
+    finally:
+        signal.signal(signal.SIGINT, old)
+    subprocess.run(["stty", "sane"], stderr=subprocess.DEVNULL)
+    pause()
+    return rc
+
+
+# ── facts ───────────────────────────────────────────────────────────────────
+def version() -> str:
+    try:
+        with open(os.path.join(APP_DIR, "VERSION")) as f:
+            return f.read().strip() or "?"
+    except OSError:
+        return "(pre-1.3)"
+
+
+def all_ipv4() -> list[str]:
+    return [a["cidr"].split("/")[0] for n in Z.list_nics() for a in n["ipv4"]]
+
+
+def default_fqdn() -> str:
+    short = out(["hostname"]) or "zerto-monitor"
+    _, search = Z.resolver()
+    dom = search[0] if search else out(["hostname", "-d"])
+    return f"{short}.{dom}" if dom and "." not in short else (out(["hostname", "-f"]) or short)
+
+
+def fmt_ips(n: dict) -> str:
+    return ", ".join(a["cidr"] + (" (dhcp)" if a["dynamic"] else "") for a in n["ipv4"]) or "no IPv4"
+
+
+def web_check() -> str:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE                     # our own certificate, on loopback
+    try:
+        c = http.client.HTTPSConnection("127.0.0.1", 443, timeout=4, context=ctx)
+        c.request("GET", "/healthz")
+        s = c.getresponse().status
+        c.close()
+        return "responding" if s == 200 else f"answered HTTP {s}"
+    except (OSError, http.client.HTTPException) as e:
+        return f"NOT responding ({type(e).__name__})"
+
+
+def uptime() -> str:
+    try:
+        with open("/proc/uptime") as f:
+            secs = int(float(f.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return "?"
+    d, r = divmod(secs, 86400)
+    h, m = r // 3600, (r % 3600) // 60
+    return f"{d}d {h}h {m}m" if d else f"{h}h {m}m"
+
+
+def chrony() -> dict:
+    return Z.read_kv_colon(out(["chronyc", "-n", "tracking"], 5))
+
+
+def ovf_held() -> list[str]:
+    return [h for h in Z.read_kv(Z.OVFSTATE).get("held", "").split(",") if h]
+
+
+def services() -> dict:
+    return {u: out(["systemctl", "is-active", u], 5) or "unknown"
+            for u in ("zerto-monitor", "nginx", "snmpd")}
+
+
+def status_text() -> str:
+    host, fqdn = out(["hostname"]), default_fqdn()
+    nics, (gw, dev), (dns, search) = Z.list_nics(), Z.default_gateway(), Z.resolver()
+    ip = Z.primary_ipv4()
+    svc, du, tr = services(), shutil.disk_usage("/"), chrony()
+    sync = out(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], 5) or "?"
+    ref = tr.get("Reference ID", "")
+    ref = ref[ref.find("(") + 1:-1] if "(" in ref else ref
+    try:
+        load = " ".join(f"{x:.2f}" for x in os.getloadavg())
+    except OSError:
+        load = "?"
+    L = [f"Appliance  Zerto Monitor {version()}",
+         f"Hostname   {host}   ({fqdn})",
+         f"Web        https://{ip or '<no address>'}/    https://{fqdn}/",
+         "", "Network"]
+    for n in nics:
+        L.append(f"  {n['name']:<10}{n['mac']}  {n['driver'] or '?':<8} {n['state']:<5} {fmt_ips(n)}")
+    L += [f"  gateway   {gw or 'none'}" + (f" via {dev}" if dev else ""),
+          f"  DNS       {', '.join(dns) or 'none'}    search {' '.join(search) or 'none'}",
+          "",
+          "Services   " + "   ".join(f"{k}: {v}" for k, v in svc.items()),
+          f"Web check  {web_check()}",
+          f"Disk /     {(du.total - du.free) / 2**30:.1f} of {du.total / 2**30:.1f} GiB used "
+          f"({100 * (du.total - du.free) / max(du.total, 1):.0f}%), {du.free / 2**30:.1f} GiB free",
+          f"Uptime     {uptime()}    load {load}",
+          f"Time       {time.strftime('%Y-%m-%d %H:%M:%S %Z')}    NTP synchronised: {sync}"
+          + (f" (source {ref}, {tr.get('Leap status', '?')})" if ref else "")]
+    held = ovf_held()
+    if held:
+        L += ["", "! vCenter still holds deploy-time passwords in this VM's vApp properties:",
+              "  " + ", ".join(held) + "  (Break-glass > Security posture)"]
+    st = Z.read_pending()
+    if st and not st.get("confirmed"):
+        L += ["", f"! A network change is waiting for confirmation: {st.get('summary', '')}"]
+    return "\n".join(L)
+
+
+# ── network ─────────────────────────────────────────────────────────────────
+def pending_prompt(ui: UI) -> None:
+    st = Z.read_pending()
+    if not st or st.get("confirmed"):
+        return
+    left = int(float(st.get("deadline", 0)) - time.time())
+    if left <= 0:
+        return
+    if ui.yesno(f"A network change is waiting for confirmation:\n\n  {st.get('summary', '?')}\n\n"
+                f"It rolls back by itself in about {left} seconds. If you reached the appliance "
+                "the way you intended, keep it.\n\nKeep the new network configuration?",
+                "Pending network change", yes="Keep", no="Let it roll back"):
+        ui.msg(ops("net-confirm", timeout=60)[1], "Pending network change")
+
+
+def net_show(ui: UI) -> None:
+    gw, dev = Z.default_gateway()
+    dns, search = Z.resolver()
+    L = ["Adapters (name, MAC, driver, link, IPv4):"]
+    L += [f"  {n['name']:<10}{n['mac']}  {n['driver'] or '?':<8} {n['state']:<5} {fmt_ips(n)}"
+          for n in Z.list_nics()]
+    L += ["", f"Default gateway  {gw or 'none'}" + (f" via {dev}" if dev else ""),
+          f"DNS servers      {', '.join(dns) or 'none'}",
+          f"Search domains   {' '.join(search) or 'none'}", "", "netplan:", ops("net-show")[1]]
+    ui.view("\n".join(L), "Network configuration")
+
+
+def net_configure(ui: UI) -> None:
+    T = "Configure network"
+    nics = Z.list_nics()
+    if not nics:
+        ui.msg("No network adapters were found.", T)
+        return
+    gw_now, dev_now = Z.default_gateway()
+    pick = ui.menu("Which adapter? (name, MAC, driver, link, addresses)",
+                   [(n["name"], f"{n['mac']}  {n['driver'] or '?'}  {n['state']}  {fmt_ips(n)}")
+                    for n in nics], T, default=dev_now or nics[0]["name"])
+    if not pick:
+        return
+    nic = next(n for n in nics if n["name"] == pick)
+    others = [n for n in nics if n["ipv4"] and n["name"] != pick]
+    if others and not nic["ipv4"]:      # console-ops refuses this too; say so before the questions
+        o = others[0]
+        ui.msg(f"{o['name']} ({fmt_ips(o)}) holds the network configuration. The appliance keeps "
+               f"ONE adapter's configuration, so configuring {pick} would remove {o['name']}'s "
+               f"address and gateway.\n\nReconfigure {o['name']} instead, or remove that vNIC in "
+               "vCenter first.", T)
+        return
+    mac = nic["mac"]
+    cur = nic["ipv4"][0] if nic["ipv4"] else None
+    mode = ui.menu("How should it get its address?",
+                   [("static", "Static address"), ("dhcp", "DHCP")], T,
+                   default="dhcp" if (cur and cur["dynamic"]) else "static")
+    if not mode:
+        return
+    address = gateway = ""
+    if mode == "static":
+        def chk_addr(v):
+            v = v.strip()
+            if "/" in v:
+                return Z.build_network("static", mac=mac, address=v)["address"]
+            Z.v_ipv4(v, "address")
+            return v
+        address = ask(ui, "IPv4 address with its prefix or mask, e.g. 192.0.2.10/24 or "
+                      "192.0.2.10/255.255.255.0 (or the address alone):",
+                      cur["cidr"] if cur else "", chk_addr, T)
+        if not address:
+            return
+        if "/" not in address:
+            a = address
+            address = ask(ui, "Prefix length (e.g. 24) or subnet mask (e.g. 255.255.255.0):", "24",
+                          lambda v: Z.build_network("static", mac=mac, address=f"{a}/{v.strip().lstrip('/')}")["address"], T)
+            if not address:
+                return
+        net = ipaddress.IPv4Interface(address).network
+        hosts = net.hosts()
+        first = str(next(iter(hosts), "")) if net.prefixlen < 31 else ""
+        init_gw = gw_now if gw_now and ipaddress.IPv4Address(gw_now) in net else first
+        while True:
+            gateway = ask(ui, f"Default gateway (inside {net}). Leave blank for none:", init_gw,
+                          lambda v: Z.build_network("static", mac=mac, address=address,
+                                                    gateway=v)["gateway"] or "", T)
+            if gateway is None:
+                return
+            if gateway or ui.yesno(f"No default gateway: the appliance will only be reachable "
+                                   f"from {net}. Continue without one?", T, default_no=True):
+                break
+    dns_now, search_now = Z.resolver()
+    hint = " Leave blank to use the servers DHCP hands out." if mode == "dhcp" else ""
+    dns = ask(ui, "DNS servers (up to 3, space or comma separated)." + hint,
+              ", ".join(dns_now) if mode == "static" else "", Z.v_dns, T)
+    if dns is None:
+        return
+    if mode == "static" and not dns and not ui.yesno(
+            "No DNS servers: the appliance won't resolve ZVM, SMTP or package-mirror names. "
+            "Continue anyway?", T, default_no=True):
+        return
+    search = ask(ui, "DNS search domains (space or comma separated, optional):",
+                 " ".join(search_now), Z.v_search, T)
+    if search is None:
+        return
+    mtu = ask(ui, "MTU (blank leaves the default, normally 1500):",
+              nic["mtu"] if nic["mtu"] not in ("", "1500") else "", lambda v: Z.v_mtu(v) or "", T)
+    if mtu is None:
+        return
+    try:                                # matched by MAC: never by name (it can change) or driver
+        spec = Z.build_network(mode, mac=mac, address=address, gateway=gateway, dns=dns,
+                               search=search, mtu=mtu)
+    except Z.Invalid as e:
+        ui.msg(str(e), "Not valid")
+        return
+
+    new_ip = spec["address"].split("/")[0] if spec["address"] else ""
+    sc = os.environ.get("SSH_CONNECTION", "").split()
+    via = sc[2] if len(sc) == 4 else ""
+    warn = ""
+    if via and via in [a["cidr"].split("/")[0] for a in nic["ipv4"]] and via != new_ip:
+        target = new_ip or "the new DHCP address (vCenter shows it in the VM summary)"
+        warn = (f"\n\nYOU ARE CONNECTED OVER SSH TO {via}, which this change "
+                f"{'may remove' if mode == 'dhcp' else 'removes'}. If it goes, this session "
+                f"freezes. To keep the change, within "
+                f"{Z.TRY_TIMEOUT} seconds connect to {target} (SSH or the VM console) and sign "
+                "in: the menu will ask whether to keep it. If nobody does, the appliance goes "
+                f"back to {via} by itself.")
+    if not ui.yesno("This configuration will be applied with 'netplan try': it goes live at once "
+                    f"and rolls back by itself after {Z.TRY_TIMEOUT} seconds unless you press "
+                    "ENTER to keep it. The current files are saved first." + warn +
+                    "\n\n" + Z.render_netplan(spec), T, default_no=bool(warn),
+                    yes="Apply", no="Cancel"):
+        return
+    args = ["net-apply", "--mode", spec["mode"], "--mac", spec["match"]["macaddress"]]
+    for flag, val in (("--address", spec["address"]), ("--gateway", spec["gateway"]),
+                      ("--dns", ",".join(spec["dns"])), ("--search", ",".join(spec["search"])),
+                      ("--mtu", spec["mtu"] or "")):
+        if val:
+            args += [flag, str(val)]
+    rc = on_terminal("Network change", args)
+    if rc == 0:
+        offer_cert(ui, "network")
+    elif rc == 3:
+        ui.msg("The change was rolled back. The previous configuration is in place.", T)
+
+
+def net_restore(ui: UI) -> None:
+    if ui.yesno("Go back to the configuration saved before the last network change? It is "
+                f"applied with 'netplan try' too, so it rolls back after {Z.TRY_TIMEOUT} seconds "
+                "unless you keep it.", "Restore previous network configuration", default_no=True):
+        if on_terminal("Restore previous network configuration", ["net-restore"]) == 0:
+            offer_cert(ui, "network")
+
+
+def cert_details() -> dict:
+    t = out(["openssl", "x509", "-in", CERT, "-noout", "-subject", "-issuer", "-enddate",
+             "-ext", "subjectAltName"])
+    d = {"subject": "", "issuer": "", "end": "", "san": ""}
+    for ln in t.splitlines():
+        for k, pre in (("subject", "subject="), ("issuer", "issuer="), ("end", "notAfter=")):
+            if ln.startswith(pre):
+                d[k] = ln[len(pre):].strip()
+        if "DNS:" in ln or "IP Address:" in ln:
+            d["san"] = ln.strip()
+    d["present"] = bool(d["subject"])
+    d["self_signed"] = d["present"] and d["subject"] == d["issuer"]
+    return d
+
+
+def offer_cert(ui: UI, why: str) -> None:
+    T = "Web certificate"
+    c, fqdn = cert_details(), default_fqdn()
+    missing = [ip for ip in all_ipv4() if f"IP Address:{ip}" not in c["san"]]
+    if c["present"] and not c["self_signed"]:
+        text = (f"The installed certificate was issued by:\n  {c['issuer']}\n\nRegenerating "
+                "REPLACES it with a self-signed one. Usually you'd get a new one from your CA "
+                "instead (Admin > Certificate in the web console).\n\nReplace it anyway?")
+        default_no = True
+    else:
+        if why == "network" and c["present"] and not missing:
+            return                                      # already covers every address
+        text = (f"The web certificate covers:\n  {c['san'] or 'nothing (none installed)'}\n\n"
+                + (f"It does not include {', '.join(missing)}, so browsers will warn on "
+                   "that address.\n\n" if missing else "")
+                + "Create a new self-signed certificate for this name and every current address?")
+        default_no = why == "menu" and not missing
+    if not ui.yesno(text, T, default_no=default_no):
+        return
+    name = ask(ui, "DNS name for the certificate (the short name and every IPv4 address are "
+               "added automatically):", fqdn, Z.v_fqdn, T)
+    if name:
+        ui.info("Generating the certificate...", T)
+        ui.msg(ops("tls-selfsigned", name, timeout=180)[1], T)
+
+
+def network_menu(ui: UI) -> None:
+    while True:
+        st = Z.read_pending()
+        items = [("1", "Show the current configuration"),
+                 ("2", "Configure: DHCP or static, DNS, MTU"),
+                 ("3", "Restore the configuration from before the last change"),
+                 ("4", "Regenerate the self-signed web certificate")]
+        if st and not st.get("confirmed"):
+            items.insert(0, ("C", "Keep the pending change: " + st.get("summary", "")[:40]))
+        c = ui.menu("Network", items, "Network")
+        if c is None:
+            return
+        if c == "C":
+            pending_prompt(ui)
+        elif c == "1":
+            net_show(ui)
+        elif c == "2":
+            net_configure(ui)
+        elif c == "3":
+            net_restore(ui)
+        elif c == "4":
+            offer_cert(ui, "menu")
+
+
+# ── hostname, time ──────────────────────────────────────────────────────────
+def hostname_menu(ui: UI) -> None:
+    T = "Hostname"
+    cur = out(["hostname"])
+    name = ask(ui, f"Current hostname: {cur}\n\nNew short hostname (letters, digits and hyphens, "
+               "no dots; the DNS domain comes from the search domain):", cur, Z.v_hostname, T)
+    if not name or name == cur:
+        return
+    rc, text = ops("hostname", name)
+    if rc == 0:
+        text += (f"\n\nBrowsers reach https://{default_fqdn()}/ only once DNS has a record "
+                 "for it.")
+    ui.msg(text, T)
+    if rc == 0:
+        offer_cert(ui, "hostname")
+
+
+def time_menu(ui: UI) -> None:
+    T = "Time and NTP"
+    while True:
+        c = ui.menu("Time and NTP (chrony)", [("1", "Status"), ("2", "NTP servers"),
+                                              ("3", "Timezone"), ("4", "Synchronise now")], T)
+        if c is None:
+            return
+        if c == "1":
+            ui.view(out(["timedatectl"]) + "\n\nchrony tracking:\n" + out(["chronyc", "-n", "tracking"], 5)
+                    + "\n\nchrony sources:\n" + out(["chronyc", "-n", "sources"], 5), T)
+        elif c == "2":
+            try:
+                with open(CHRONY_FILE) as f:
+                    cur = [ln.split()[1] for ln in f if ln.startswith(("server ", "pool "))]
+            except (OSError, IndexError):
+                cur = []
+            servers = ask(ui, "NTP servers (host names or addresses, up to 5, space or comma "
+                          "separated). They replace Ubuntu's default NTS pools, which need "
+                          "outbound 4460/tcp:", " ".join(cur), Z.v_ntp, T)
+            if servers:
+                ui.info("Applying...", T)
+                ui.msg(ops("time-ntp", *servers)[1], T)
+        elif c == "3":
+            tz_set(ui)
+        elif c == "4":
+            ui.info("Asking the NTP servers (about 10 seconds)...", T)
+            ui.msg(ops("time-sync", timeout=60)[1], T)
+
+
+def tz_set(ui: UI) -> None:
+    T = "Timezone"
+    zones = out(["timedatectl", "list-timezones"], 20).split()
+    val = out(["timedatectl", "show", "-p", "Timezone", "--value"]) or "UTC"
+    while True:
+        val = ui.input("Timezone (IANA name, e.g. America/New_York, Europe/London, UTC):", val, T)
+        if val is None:
+            return
+        if val in zones:
+            break
+        hits = [z for z in zones if val.lower() in z.lower()][:15]
+        if not hits:
+            ui.msg(f"No timezone matches '{val}'.", T)
+            continue
+        pick = ui.menu(f"'{val}' isn't a timezone name. Did you mean:", [(z, "") for z in hits], T)
+        if pick:
+            val = pick
+            break
+    ui.msg(ops("time-tz", val)[1], T)
+
+
+# ── disk, services ──────────────────────────────────────────────────────────
+def disk_menu(ui: UI) -> None:
+    T = "Disk expansion"
+    ui.info("Rescanning the virtual disk...", T)
+    rc, text = ops("disk-info", timeout=60)
+    if rc == 2:
+        ui.msg(text + "\n\nNothing to grow. Enlarge the disk in vCenter first (Edit Settings > "
+               "Hard disk 1), then come back here. No reboot is needed either way.", T)
+    elif rc != 0:
+        ui.msg(text, T)
+    elif ui.yesno(text + "\n\nGrow the root partition and its filesystem into the free space "
+                  "now? This happens online: no reboot, the service keeps running.", T):
+        ui.info("Growing the partition and filesystem...", T)
+        ui.msg(ops("disk-grow", timeout=1200)[1], T)
+
+
+def conn_test(ui: UI) -> None:
+    T = "Connectivity test"
+
+    def chk_host(v):
+        v = v.strip()
+        try:
+            ipaddress.ip_address(v)
+            return v
+        except ValueError:
+            return Z.v_fqdn(v, "host")
+
+    def chk_ports(v):
+        ports = []
+        for p in Z.split_list(v):
+            if not p.isdigit() or not 1 <= int(p) <= 65535:
+                raise Z.Invalid(f"'{p}' is not a TCP port")
+            ports.append(int(p))
+        if not 1 <= len(ports) <= 10:
+            raise Z.Invalid("give 1 to 10 ports")
+        return ports
+    host = ask(ui, "Host name or IP address to test (e.g. a ZVM, the ZCM, an SMTP relay):",
+               LAST.get("host", ""), chk_host, T)
+    if not host:
+        return
+    ports = ask(ui, "TCP ports to try (space or comma separated):",
+                LAST.get("ports", "443 9669 9989"), chk_ports, T)
+    if not ports:
+        return
+    LAST.update(host=host, ports=" ".join(map(str, ports)))
+    ui.info(f"Testing {host}...", T)
+    L = [f"Target  {host}", ""]
+    t0 = time.monotonic()
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        addrs = list(dict.fromkeys(i[4][0] for i in infos))
+        L.append(f"DNS     {', '.join(addrs)}  ({(time.monotonic() - t0) * 1000:.0f} ms)")
+    except socket.gaierror as e:
+        L.append(f"DNS     FAILED: {e.strerror or e}")
+        addrs = []
+    if addrs:
+        target = next((a for a in addrs if ":" not in a), addrs[0])
+        for port in ports:
+            t0 = time.monotonic()
+            try:
+                socket.create_connection((target, port), timeout=5).close()
+                res = f"open ({(time.monotonic() - t0) * 1000:.0f} ms)"
+            except ConnectionRefusedError:
+                res = "refused (host answers, nothing listening)"
+            except (socket.timeout, TimeoutError):
+                res = "no answer in 5 s (filtered, or unreachable)"
+            except OSError as e:
+                res = e.strerror or str(e)
+            L.append(f"TCP {port:<5} {res}")
+    dns, _ = Z.resolver()
+    gw, _ = Z.default_gateway()
+    L += ["", f"Resolvers {', '.join(dns) or 'none'}    gateway {gw or 'none'}"]
+    ui.msg("\n".join(L), T)
+
+
+def services_menu(ui: UI) -> None:
+    T = "Services and logs"
+    while True:
+        s = services()
+        c = ui.menu("   ".join(f"{k}: {v}" for k, v in s.items()),
+                    [("1", "Restart zerto-monitor (the web app)"), ("2", "Restart nginx"),
+                     ("3", "App log (journalctl -u zerto-monitor, last 200 lines)"),
+                     ("4", "nginx error log (last 200 lines)"),
+                     ("5", "Connectivity test (DNS + TCP)")], T)
+        if c is None:
+            return
+        if c in ("1", "2"):
+            unit = "zerto-monitor" if c == "1" else "nginx"
+            if ui.yesno(f"Restart {unit}? Pages in flight get an error for a few seconds.", T):
+                ui.info(f"Restarting {unit}...", T)
+                ui.msg(ops("svc-restart", unit, timeout=180)[1], T)
+        elif c in ("3", "4"):
+            ui.view(ops("logs", "app" if c == "3" else "nginx", timeout=60)[1],
+                    "App log" if c == "3" else "nginx error log")
+        elif c == "5":
+            conn_test(ui)
+
+
+# ── upgrade ─────────────────────────────────────────────────────────────────
+def upgrade_menu(ui: UI) -> None:
+    T = "Upgrade"
+    c = ui.menu(f"Installed: Zerto Monitor {version()}",
+                [("1", f"Apply a signed update ({BUNDLE})"),
+                 ("2", "Repair: re-run the installer for the installed version")], T)
+    if c == "1":
+        try:
+            st = os.lstat(BUNDLE)
+        except OSError:
+            ui.msg(f"There's no {BUNDLE} yet. Download the release's zerto-monitor-<version>.zmupdate "
+                   "from the release and copy it over:\n\n"
+                   f"  scp zerto-monitor-x.y.z.zmupdate {os.environ.get('USER', 'admin')}@"
+                   f"{Z.primary_ipv4() or '<appliance>'}:{BUNDLE}\n\nThen come back here.", T)
+            return
+        dg = ui.yesno("Allow a reinstall or downgrade? Normally No: only a NEWER signed release "
+                      "installs.", T, default_no=True)
+        if not ui.yesno(f"{BUNDLE}\n  size   {st.st_size:,} bytes\n"
+                        f"  date   {time.strftime('%Y-%m-%d %H:%M', time.localtime(st.st_mtime))}\n\n"
+                        "The signed updater checks its signature against the pinned release key "
+                        f"and that it is {'any version' if dg else 'newer than the installed one'}, "
+                        "backs up, installs, runs 'firstboot.py --upgrade' and health-checks the "
+                        "site; a failed check restores the previous version. Network, accounts, "
+                        "data, keys and the certificate are not touched. The web app restarts."
+                        "\n\nApply it now?", T, default_no=True):
+            return
+        on_terminal("Upgrade", ["upgrade"] + (["--allow-downgrade"] if dg else []))
+    elif c == "2":
+        if ui.yesno("Re-run 'firstboot.py --upgrade' for the version already installed? Use it "
+                    "after a first boot that failed (e.g. no outbound network at the time) or to "
+                    "restore a damaged service. Network, accounts and data are not touched.", T):
+            on_terminal("Repair", ["upgrade", "--repair"])
+
+
+# ── break-glass ─────────────────────────────────────────────────────────────
+def new_password(ui: UI, title: str, minlen: int, maxbytes: int) -> str | None:
+    while True:
+        p1 = ui.password(f"New password ({minlen} or more characters):", title)
+        if p1 is None:
+            return None
+        if len(p1) < minlen or len(p1.encode()) > maxbytes:
+            ui.msg(f"Use {minlen} to {maxbytes} characters.", title)
+            continue
+        p2 = ui.password("The same password again:", title)
+        if p2 is None:
+            return None
+        if p1 == p2:
+            return p1
+        ui.msg("The two entries don't match.", title)
+
+
+def web_password(ui: UI) -> None:
+    T = "Web console password"
+    rc, text = ops("web-users", timeout=60)
+    if rc != 0:
+        ui.msg(text, T)
+        return
+    users = [ln.split("\t") for ln in text.splitlines() if ln.count("\t") == 2]
+    items = [(u, f"{role}, {src}") for u, role, src in users] + [("+", "Create a new local admin")]
+    pick = ui.menu("Whose password? Entra ID users have none to reset; if Entra sign-in is "
+                   "broken, create a local admin instead.", items, T)
+    if not pick:
+        return
+    create = pick == "+"
+    if create:
+        def chk_user(v):
+            v = v.strip()
+            if not Z.WEBUSER_RE.match(v):
+                raise Z.Invalid("user names are 1-128 letters, digits and . _ @ + -")
+            if any(u == v for u, _, _ in users):
+                raise Z.Invalid(f"'{v}' already exists; pick it from the list instead")
+            return v
+        pick = ask(ui, "User name for the new local admin:", "", chk_user, T)
+        if not pick:
+            return
+    elif any(u == pick and src == "entra" for u, _, src in users):
+        ui.msg(f"'{pick}' signs in with Entra ID and has no local password.", T)
+        return
+    pw = new_password(ui, T, 10, 72)
+    if pw is None:
+        return
+    rc, text = ops("web-password", pick, *(["--create"] if create else []), secret=pw, timeout=120)
+    del pw
+    ui.msg(text, T)
+
+
+def os_password(ui: UI) -> None:
+    T = "Linux password"
+    user = os.environ.get("USER") or out(["id", "-un"])
+    if not ui.yesno(f"Set the Linux password for '{user}'? You need one to sign in on the VM "
+                    "console (which network changes may require), and for full sudo.", T):
+        return
+    pw = new_password(ui, T, 8, 128)
+    if pw is None:
+        return
+    rc, text = ops("os-password", secret=pw, timeout=60)
+    del pw
+    ui.msg(text, T)
+
+
+def ssh_password(ui: UI) -> None:
+    T = "SSH password sign-in"
+    rc, text = ops("ssh-password", "status", timeout=60)
+    if rc != 0:
+        ui.msg(text, T)
+        return
+    on = "=yes" in text
+    try:
+        with open(os.path.expanduser("~/.ssh/authorized_keys")) as f:
+            keys = sum(1 for ln in f if ln.strip() and not ln.startswith("#"))
+    except OSError:
+        keys = 0
+    if on:
+        q = "SSH password sign-in is ON.\n\nTurn it OFF, so SSH needs a key?"
+        if not keys:
+            q += ("\n\nWARNING: your account has no SSH key in ~/.ssh/authorized_keys. With "
+                  "passwords off you could only sign in on the VM console.")
+    else:
+        q = ("SSH password sign-in is OFF (keys only).\n\nTurn it ON? Accounts without a "
+             "password still can't use it. Root stays key-only either way.")
+    if ui.yesno(q, T, default_no=on and not keys):
+        ui.msg(ops("ssh-password", "off" if on else "on", timeout=90)[1], T)
+
+
+def breakglass_menu(ui: UI) -> None:
+    T = "Break-glass and security"
+    while True:
+        c = ui.menu("Recovery and security", [
+            ("1", "Reset a web console password (or create a local admin)"),
+            ("2", "Set this account's Linux password"),
+            ("3", "SSH password sign-in on/off"),
+            ("4", "Security posture summary")], T)
+        if c is None:
+            return
+        if c == "1":
+            web_password(ui)
+        elif c == "2":
+            os_password(ui)
+        elif c == "3":
+            ssh_password(ui)
+        elif c == "4":
+            ui.info("Checking...", T)
+            ui.view(ops("posture", timeout=60)[1], "Security posture")
+
+
+def power_menu(ui: UI) -> None:
+    T = "Reboot / shut down"
+    c = ui.menu("The web console is unavailable until the appliance is back.",
+                [("reboot", "Reboot"), ("poweroff", "Shut down")], T)
+    if c and ui.yesno(f"{'Reboot' if c == 'reboot' else 'Shut down'} the appliance now?", T,
+                      default_no=True):
+        ui.msg(ops("power", c, timeout=60)[1], T)
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+def main_menu(ui: UI, login: bool) -> int:
+    choice = "1"
+    while True:
+        svc, ip = services(), Z.primary_ipv4()
+        head = (f"{out(['hostname'])}    https://{ip or '<no address>'}/\n"
+                + "   ".join(f"{k}: {v}" for k, v in svc.items()))
+        st = Z.read_pending()
+        if st and not st.get("confirmed"):
+            head += "\n! a network change is waiting for confirmation (Network)"
+        choice = ui.menu(head, [
+            ("1", "Status"), ("2", "Network"), ("3", "Hostname"), ("4", "Time and NTP"),
+            ("5", "Disk expansion"), ("6", "Services and logs"), ("7", "Upgrade"),
+            ("8", "Break-glass and security"), ("9", "Reboot / shut down"),
+            ("0", "Shell (bash)"), ("Q", "Log out" if login else "Quit")],
+            "Zerto Monitor appliance", default=choice, cancel="Shell")
+        if choice is None or choice == "0":
+            print("\033[H\033[2J", end="")
+            print("Plain shell. Type 'zerto-monitor-console' to reopen the menu, 'exit' to log out.\n")
+            return 0
+        if choice == "Q":
+            print("\033[H\033[2J", end="")
+            return LOGOUT if login else 0
+        {"1": lambda: ui.msg(status_text(), "Status"), "2": lambda: network_menu(ui),
+         "3": lambda: hostname_menu(ui), "4": lambda: time_menu(ui), "5": lambda: disk_menu(ui),
+         "6": lambda: services_menu(ui), "7": lambda: upgrade_menu(ui),
+         "8": lambda: breakglass_menu(ui), "9": lambda: power_menu(ui)}.get(choice, lambda: None)()
+
+
+def main(argv: list[str]) -> int:
+    global Z
+    if "--status" in argv:              # plain text, no dialogs: handy over `ssh host cmd`
+        Z = load_ops()
+        print(status_text())
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("zerto-monitor-console needs an interactive terminal (try --status).")
+        return 0
+    if os.environ.get("TERM", "dumb") in ("dumb", "unknown", ""):
+        print("TERM is dumb; the menu needs a real terminal (try --status).")
+        return 0
+    if not os.access(WHIPTAIL, os.X_OK):
+        print("whiptail is missing: run 'sudo apt-get install whiptail', or re-run "
+              "firstboot.py --upgrade.")
+        return 0
+    Z = load_ops()
+    ui = UI(f"Zerto Monitor {version()}  -  {out(['hostname'])}")
+    try:
+        pending_prompt(ui)
+        ui.msg(status_text(), "Status")
+        return main_menu(ui, "--login" in argv)
+    except KeyboardInterrupt:
+        print("\033[H\033[2J", end="")
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as exc:                                    # noqa: BLE001
+        # never trap anyone: any failure here just leaves them at the shell prompt
+        print(f"\nzerto-monitor-console: {type(exc).__name__}: {exc}\n"
+              "Dropping to the shell. 'zerto-monitor-console' reopens the menu.")
+        sys.exit(1)

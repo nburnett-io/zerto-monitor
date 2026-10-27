@@ -1,0 +1,34 @@
+{% extends "base.html" %}{% block title %}VRAs · Zerto Monitor{% endblock %}
+{% set autorefresh = 60 %}
+{% block body %}
+<h1>VRA health</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<div class="strip">
+  <div class="cell"><div class="k">Overall</div><div class="v {{ 'fail' if counts.health == 'failure' else ('warn' if counts.health == 'warning' else 'good') }}">{{ counts.health|upper }}</div></div>
+  <div class="cell"><div class="k">VRAs</div><div class="v">{{ counts.total }}</div></div>
+  <div class="cell"><div class="k">Healthy</div><div class="v good">{{ counts.healthy }}</div></div>
+  <div class="cell"><div class="k">Disconnected (ZVM0002)</div><div class="v {{ 'fail' if counts.disconnected else 'good' }}">{{ counts.disconnected }}</div></div>
+  <div class="cell"><div class="k">Subnet-mask drift</div><div class="v {{ 'warn' if counts.mask_mismatch else 'good' }}">{{ counts.mask_mismatch }}</div></div>
+  <div class="cell"><div class="k">Status ≠ OK</div><div class="v {{ 'warn' if counts.not_ok else 'good' }}">{{ counts.not_ok }}</div></div>
+</div>
+
+<h2>By site — click a site to drill down</h2>
+<div class="scroll"><table>
+  <tr><th>Site</th><th>Health</th><th class="num">VRAs</th><th class="num c2">Healthy</th><th class="num">Disconnected</th><th class="num">Mask drift</th><th class="num c2">Status ≠ OK</th><th class="num c3">Prot vols</th><th class="num c3">Rec vols</th><th class="c1">Versions</th><th class="c2">Memory</th><th>Sizing standard</th></tr>
+  {% for s in sites %}
+  <tr class="{{ s.health if s.health != 'healthy' else '' }}">
+    <td><a href="/vras/{{ s.site|urlencode }}">{{ s.site }}</a>{% if s.stale %} <span class="small">(last good poll)</span>{% endif %}<div class="small">{{ s.source }}</div></td>
+    <td><span class="tag {{ s.health }}">{{ s.health }}</span></td>
+    <td class="num">{{ s.total }}</td><td class="num c2">{{ s.healthy }}</td>
+    <td class="num">{{ s.disconnected or '' }}</td><td class="num">{{ s.mask_mismatch or '' }}</td><td class="num c2">{{ s.not_ok or '' }}</td>
+    <td class="num c3">{{ s.protected_vols }}</td><td class="num c3">{{ s.recovery_vols }}</td>
+    <td class="mono c1">{{ s.versions|join(', ') }}{% if s.versions|length > 1 %} <span class="tag warning">mixed</span>{% endif %}</td>
+    <td class="num c2">{{ s.min_mem }}{% if s.max_mem != s.min_mem %}–{{ s.max_mem }}{% endif %}G</td>
+    <td>{% if s.standard %}{{ s.standard.memory_gb }}G / {{ s.standard.cpus }} vCPU
+          <div class="small">{{ s.sizing.ok }} of {{ s.total }} meet it{% if s.sizing.under or s.sizing.mixed %} · <b>{{ s.sizing.under + s.sizing.mixed }} below</b>{% endif %}</div>
+        {% else %}<a class="small" href="/vras/{{ s.site|urlencode }}#sizing">{{ 'set one' if user and user.can_operate else 'not set' }}</a>{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="12" class="small">No VRA data yet.</td></tr>{% endfor %}
+</table></div>
+<p class="small">Mask drift = a VRA's subnet mask differs from the majority of VRAs sharing its gateway. That defect has taken down several VRAs at once in production.</p>
+{% endblock %}

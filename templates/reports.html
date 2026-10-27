@@ -1,0 +1,23 @@
+{% extends "base.html" %}{% block title %}Reports · Zerto Monitor{% endblock %}
+{% block body %}
+<h1>Monthly DR reports</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<p class="small">One report per customer (zORG) per month: RPO and journal-history compliance, health, failover tests and their RTO,
+  changes and pauses, alerts, open issues, the recovery plan and backup coverage. Open it on screen, or download the branded PDF.
+  Compliance figures come from the monitor's own hourly samples, so months before it began recording show only tests and events.</p>
+<form method="get" action="" class="formrow" style="max-width:48rem" onsubmit="location.href='/reports/'+encodeURIComponent(this.zorg.value)+'/'+this.month.value+(this.pdf.checked?'/pdf':'');return false;">
+  <div class="fld"><span class="fl">zORG</span><select aria-label="zORG" name="zorg">{% for z in zorgs|sort(attribute='name') %}<option value="{{ z.name }}">{{ z.name }}</option>{% endfor %}</select></div>
+  <div class="fld"><span class="fl">Month</span><select aria-label="Month" name="month">{% for m in months %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></div>
+  <label><span>Format</span><span><input type="checkbox" name="pdf" value="1"> download PDF</span></label>
+  <span><button type="submit">Open report</button></span>
+</form>
+<div class="scroll"><table>
+  <tr><th>zORG</th><th class="num">VPGs</th><th>Health now</th><th class="c2">Last test</th>{% for m in months[:3] %}<th>{{ m }}</th>{% endfor %}</tr>
+  {% for z in zorgs|sort(attribute='name') %}
+  <tr><td class="name"><a href="/zorgs/{{ z.name|urlencode }}">{{ z.name }}</a></td><td class="num">{{ z.vpg_count }}</td>
+    <td>{% if z.failure %}<span class="tag failure">{{ z.failure }} failing</span>{% elif z.warning %}<span class="tag warning">{{ z.warning }} warning</span>{% else %}<span class="tag ok">healthy</span>{% endif %}</td>
+    <td class="small c2">{{ z.last_test }}</td>
+    {% for m in months[:3] %}<td class="small"><a href="/reports/{{ z.name|urlencode }}/{{ m }}">view</a> · <a href="/reports/{{ z.name|urlencode }}/{{ m }}/pdf">PDF</a></td>{% endfor %}</tr>
+  {% endfor %}
+</table></div>
+{% endblock %}

@@ -1,0 +1,75 @@
+{% extends "base.html" %}{% block title %}{{ v.name if v else 'VPG' }} · Zerto Monitor{% endblock %}
+{% block body %}{% import "_fix.html" as fx %}{% set here = '/vpgs/' ~ (key|urlencode) %}
+{% if v %}<p class="small"><a href="/zorgs/{{ (v.org or '(no zORG)')|urlencode }}">← {{ v.org or '(no zORG)' }}</a></p>{% endif %}
+<h1>{{ v.name if v else key }}</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+{% if not v %}<div class="note">This VPG isn't in the current data (deleted, or its ZVM isn't answering). Its history, timeline and backups are below.</div>{% endif %}
+{% if v %}
+<div class="strip">
+  <div class="cell"><div class="k">State</div><div class="v {{ 'fail' if v.health == 'failure' else ('warn' if v.health == 'warning' else 'good') }}" style="font-size:1rem">{{ v.health|upper }}</div><div class="small">{{ v.status }} / {{ v.sub }}</div></div>
+  <div class="cell"><div class="k">RPO now / target</div><div class="v">{{ v.rpo_h }}<span class="small"> / {{ v.rpo_cfg|age }}</span></div></div>
+  <div class="cell"><div class="k">Journal history</div><div class="v" style="font-size:1rem">{{ ((v.history_min or 0) * 60)|age }} / {{ ((v.history_cfg_min or 0) * 60)|age }}</div><div class="small">actual / configured</div></div>
+  <div class="cell"><div class="k">{{ hours // 24 }}-day RPO compliance</div><div class="v {{ 'good' if (series.rpo_ok_pct or 0) >= 99 else 'warn' }}">{{ series.rpo_ok_pct if series.rpo_ok_pct is not none else '—' }}{% if series.rpo_ok_pct is not none %}%{% endif %}</div></div>
+  <div class="cell"><div class="k">VMs</div><div class="v">{{ v.vms }}</div></div>
+  <div class="cell"><div class="k">Path</div><div class="v" style="font-size:.9rem">{{ v.protected_site }} → {{ v.recovery_site }}</div></div>
+  <div class="cell"><div class="k">Last test</div><div class="v" style="font-size:1rem">{{ (v.last_test or 'never')[:10] }}</div></div>
+</div>
+{% if v.health != 'healthy' %}
+<div class="scroll" style="margin-bottom:1rem"><table><tr><th>Why</th><th>Suggested fix</th></tr>
+<tr><td class="why">{{ v.why }}{% if v.alerts %}<details><summary>{{ v.alerts|length }} alert(s)</summary>{% for a in v.alerts %}<div class="small"><span class="tag {{ 'failure' if a.level == 'Error' else 'warning' }}">{{ a.id }}</span> {{ a.text }}</div>{% endfor %}</details>{% endif %}</td>
+<td class="fix">{{ fx.cell(v.fixes, v.fix_keys, here, user) }}</td></tr></table></div>
+{% endif %}
+{% endif %}
+
+<h2>Trends <span class="small" style="text-transform:none;letter-spacing:0">— <a href="?hours=24">24 h</a> · <a href="?hours=168">7 days</a> · <a href="?hours=720">30 days</a></span></h2>
+{% if rpo_chart %}
+<div class="grid2">
+  <div class="chart"><div class="ttl">RPO (seconds behind)</div>{{ rpo_chart }}</div>
+  <div class="chart"><div class="ttl">Journal history vs configured</div>{{ hist_chart }}</div>
+</div>
+<div class="chart"><div class="ttl">Journal size</div>{{ jrnl_chart }}</div>
+<p class="small">Each point is one hour: the worst and average RPO seen in it, the shortest journal history. Collected from every poll since this appliance began recording trends{% if series.since %} ({{ series.since.strftime('%Y-%m-%d %H:%M') }} UTC in this window){% endif %}; gaps are hours with no live poll.</p>
+{% else %}<p class="small">No trend data for this VPG yet — it builds up from every poll (hourly points).</p>{% endif %}
+
+<h2 id="timeline">Timeline</h2>
+{% if events %}
+<div class="scroll tl"><table>
+  <tr><th>When (UTC)</th><th>What</th><th>Type</th><th>By</th><th>Detail</th></tr>
+  {% for e in events %}
+  <tr class="{{ 'failure' if e.ok == 0 else '' }}"><td class="when">{{ e.when }}</td><td><span class="tag k-{{ e.kind }}">{{ e.label }}</span></td>
+    <td class="small">{{ e.type }}</td><td class="small">{{ e.user or '' }}</td><td class="why">{{ e.text }}{% if e.ok == 0 %} <span class="tag failure">failed</span>{% endif %}</td></tr>
+  {% endfor %}
+</table></div>
+{% else %}<p class="small">No changes, pauses, tests or failovers recorded for this VPG.</p>{% endif %}
+
+<h2 id="tests">Failover tests &amp; recoveries</h2>
+{% if tests %}
+<div class="scroll"><table>
+  <tr><th>Started (UTC)</th><th>Type</th><th>Result</th><th class="num">RTO</th><th>By</th><th>Notes</th><th class="c2">Steps</th></tr>
+  {% for t in tests %}
+  <tr class="{{ 'failure' if t.ok == false else '' }}"><td class="when mono">{{ t.started[:16].replace('T', ' ') }}</td><td class="small">{{ t.rtype }}</td>
+    <td><span class="tag {{ 'ok' if t.ok else ('failure' if t.ok == false else 'info') }}">{{ t.status }}</span></td>
+    <td class="num">{{ (t.rto_s|int)|age if t.rto_s is not none else '—' }}</td><td class="small">{{ t.by_user }}</td><td class="why">{{ t.notes }}</td>
+    <td class="c2"><details><summary>{{ t.steps|length }} steps</summary>{% for s in t.steps %}<div class="small">{{ s.result }} · {{ s.what }} · {{ (s.took or '')[:8] }}</div>{% endfor %}</details></td></tr>
+  {% endfor %}
+</table></div>
+{% else %}<p class="small">No failover test or recovery reported by Zerto for this VPG (Zerto keeps these reports per ZVM).</p>{% endif %}
+
+<h2 id="backups">Settings backups</h2>
+{% if backups %}
+<div class="scroll"><table>
+  <tr><th>Export (UTC)</th><th>Site</th><th>Kind</th><th class="num">Size</th><th></th></tr>
+  {% for b in backups %}
+  <tr><td class="mono">{{ b.export_ts[:16].replace('T', ' ') }}</td><td class="small">{{ b.site }}</td><td class="small">{{ b.origin }}</td><td class="num">{{ (b.size / 1024)|round(1) }} KB</td>
+    <td>{% if user and user.can_operate %}<a class="btn ghost" href="/backups/{{ b.id }}">view / compare</a>{% endif %}</td></tr>
+  {% endfor %}
+</table></div>
+{% else %}<p class="small">No backup of this VPG's settings yet. Backups come from Zerto's own daily export, collected hourly; see <a href="/backups">Backups</a>.</p>{% endif %}
+
+{% if v and v.members %}
+<h2>VMs</h2>
+<div class="scroll"><table><tr><th>VM</th><th>Protected host</th><th>Recovery host</th><th class="num">Journal GB</th><th class="num">Prov GB</th><th class="num">MiB/s</th></tr>
+{% for m in v.members %}<tr><td class="name">{{ m.name }}</td><td class="small">{{ m.protected_host }}</td><td class="small">{{ m.recovery_host }}</td><td class="num">{{ m.journal_gb }}</td><td class="num">{{ m.prov_gb }}</td><td class="num">{{ '%.1f'|format(m.thru or 0) }}</td></tr>{% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,60 @@
+{% extends "base.html" %}{% block title %}Backups · Zerto Monitor{% endblock %}
+{% block body %}{% set eng = user and user.can_operate %}
+<h1>VPG settings backups</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<p class="small">Every ZVM writes a full export of its VPGs' settings once a day. The monitor stores each new one within the hour - every VPG's
+  RPO, journal, recovery target, networks, VMs, volumes, NICs, boot order and scripts - compressed and encrypted, and keeps them
+  <b>{{ days }} days</b>, off the ZVM. Engineers can open any backup and compare it with the one before; an admin can re-create a VPG
+  that has been deleted. Reading the exports changes nothing on the ZVM.</p>
+
+{% for w in warnings %}<div class="note"><b>Not in the latest export:</b> {{ w }} — Zerto itself couldn't export these VPGs' settings; their earlier backups (if any) are kept.</div>{% endfor %}
+<div class="strip">
+  <div class="cell"><div class="k">VPGs backed up</div><div class="v">{{ vpgs|length }}</div></div>
+  <div class="cell"><div class="k">Exports stored</div><div class="v">{{ summary|length }}</div></div>
+  <div class="cell"><div class="k">No longer in Zerto</div><div class="v {{ 'warn' if deleted else '' }}">{{ deleted }}</div><div class="small">deleted since - restorable</div></div>
+  <div class="cell"><div class="k">Kept</div><div class="v">{{ days }}<span class="small"> days</span></div></div>
+</div>
+
+{% if eng %}
+<form method="post" action="/backups/now" class="formrow" style="max-width:52rem">
+  <div class="fld"><span class="fl">Back up now</span><select aria-label="Back up now" name="site">{% for s in sites %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></div>
+  <input type="hidden" name="back" value="/backups">
+  <span><button type="submit">Back up this site</button></span>
+</form>
+<p class="small">On an armed site this asks the ZVM for a fresh export; otherwise it stores the ZVM's newest daily export.</p>
+{% endif %}
+
+<div class="sub">Stored exports</div>
+<div class="scroll"><table>
+  <tr><th>Export (UTC)</th><th>Site</th><th>Kind</th><th class="num">VPGs</th><th class="num">Size</th><th class="c2">Stored</th></tr>
+  {% for s in summary %}<tr><td class="mono">{{ s.export_ts[:16].replace('T', ' ') }}</td><td>{{ s.site }}</td><td class="small">{{ s.origin }}</td><td class="num">{{ s.vpgs }}</td><td class="num">{{ ((s.bytes or 0) / 1048576)|round(1) }} MB</td><td class="small c2">{{ (s.captured_at or '')[:16].replace('T', ' ') }}</td></tr>
+  {% else %}<tr><td colspan="6" class="small">Nothing stored yet - the first collection runs within the hour after the monitor starts.</td></tr>{% endfor %}
+</table></div>
+
+<h2>Find a VPG</h2>
+<form method="get" class="formrow" style="max-width:52rem">
+  <label>Name contains<input name="q" value="{{ q }}" placeholder="part of a VPG name"></label>
+  <label>zORG<input name="zorg" value="{{ zorg }}" placeholder="exact zORG name"></label>
+  <span><button type="submit">Search</button></span>
+</form>
+<div class="scroll"><table>
+  <tr><th>VPG</th><th>zORG</th><th class="c2">Path</th><th>Latest backup</th><th class="num">Copies</th><th>In Zerto now</th><th></th></tr>
+  {% for r in vpgs[:500] %}
+  <tr class="{{ '' if r.exists else 'warning' }}">
+    <td class="name">{% if r.vpg_id %}<a href="/vpgs/{{ r.vpg_id|urlencode }}">{{ r.vpg_name }}</a>{% else %}{{ r.vpg_name }}{% endif %}</td>
+    <td class="small">{{ r.zorg or '' }}</td><td class="small c2">{{ r.protected_site }} → {{ r.recovery_site }}</td>
+    <td class="mono">{{ r.export_ts[:16].replace('T', ' ') }}</td><td class="num">{{ r.copies }}</td>
+    <td>{% if r.exists %}<span class="tag ok">yes</span>{% else %}<span class="tag warning">deleted</span>{% endif %}</td>
+    <td>{% if eng %}<a class="btn ghost" href="/backups/{{ r.id }}">view / compare</a>{% if not r.exists %} <a class="btn" href="/backups/{{ r.id }}/restore">restore…</a>{% endif %}{% endif %}</td></tr>
+  {% endfor %}
+</table></div>
+{% if vpgs|length > 500 %}<p class="small">Showing 500 of {{ vpgs|length }} - search to narrow it.</p>{% endif %}
+
+{% if restores %}
+<h2>Restores</h2>
+<div class="scroll"><table><tr><th>#</th><th>When</th><th>By</th><th>VPG</th><th>Ticket</th><th>State</th><th>Detail</th></tr>
+{% for c in restores %}<tr class="{{ 'failure' if c.state in ('failed', 'unknown') else '' }}"><td>{{ c.id }}</td><td class="small">{{ c.at[:16].replace('T', ' ') }}</td><td class="small">{{ c.by_user }}</td><td>{{ c.target }}</td><td class="small">{{ c.ticket or '' }}</td>
+  <td><span class="tag {{ {'done': 'ok', 'failed': 'failure', 'unknown': 'failure', 'refused': 'warning'}.get(c.state, 'info') }}">{{ c.state }}</span></td><td class="why">{{ c.detail or '' }}</td></tr>{% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}

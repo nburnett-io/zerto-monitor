@@ -1,0 +1,25 @@
+{% extends "base.html" %}{% block title %}Timeline · Zerto Monitor{% endblock %}
+{% block body %}
+<h1>Timeline</h1>
+<form method="get" class="formrow" style="max-width:60rem">
+  <div class="fld"><span class="fl">zORG</span><select aria-label="zORG" name="zorg"><option value="">all zORGs</option>{% for z in zorg_names %}<option value="{{ z }}" {{ 'selected' if z == zorg }}>{{ z }}</option>{% endfor %}</select></div>
+  <div class="fld"><span class="fl">What</span><select aria-label="What" name="kind"><option value="">everything</option>{% for k, label in kinds.items() %}<option value="{{ k }}" {{ 'selected' if k == kind }}>{{ label }}</option>{% endfor %}</select></div>
+  <div class="fld"><span class="fl">Days</span><select aria-label="Days" name="days">{% for d in (1, 7, 30, 90, 365) %}<option value="{{ d }}" {{ 'selected' if d == days }}>{{ d }}</option>{% endfor %}</select></div>
+  <span><button type="submit">Show</button></span>
+</form>
+<p class="small">Who changed, paused, tested or failed over what - from every ZVM's event log, kept 400 days. Sign-ins and alert on/off flapping are left out (alerts are on the dashboard and in the alert log).</p>
+{% if rows %}
+<div class="scroll tl"><table>
+  <tr><th>When (UTC)</th><th>What</th><th>zORG</th><th>VPG</th><th class="c2">Type</th><th>By</th><th>Detail</th><th class="c3">Site</th></tr>
+  {% for e in rows %}
+  <tr class="{{ 'failure' if e.ok == 0 else '' }}">
+    <td class="when">{{ e.when }}</td><td><span class="tag k-{{ e.kind }}">{{ e.label }}</span></td>
+    <td class="small">{% if e.zorg %}<a href="/zorgs/{{ e.zorg|urlencode }}">{{ e.zorg }}</a>{% endif %}</td>
+    <td class="small">{% for id, n in e.vpgs %}<a href="/vpgs/{{ id|urlencode }}">{{ n or id[:8] }}</a>{{ ', ' if not loop.last }}{% endfor %}</td>
+    <td class="small c2">{{ e.type }}</td><td class="small">{{ e.user or '' }}</td>
+    <td class="why">{{ e.text }}{% if e.ok == 0 %} <span class="tag failure">failed</span>{% endif %}</td><td class="small c3">{{ e.site }}</td></tr>
+  {% endfor %}
+</table></div>
+{% if rows|length >= 1000 %}<p class="small">Showing the newest 1000 - narrow it by zORG or type.</p>{% endif %}
+{% else %}<p class="small">Nothing recorded for this selection. Events are collected every poll; the first start also reads back the last 30 days.</p>{% endif %}
+{% endblock %}

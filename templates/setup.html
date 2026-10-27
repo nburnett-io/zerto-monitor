@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block title %}First run · Zerto Monitor{% endblock %}
+{% block body %}
+<div class="login">
+  <h1>Create the first admin</h1>
+  <p class="small">No users exist yet. This account will be an administrator.</p>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="post" action="/setup">
+    <label>Username</label><input name="username" autofocus required>
+    <label>Password (10+ chars)</label><input name="password" type="password" minlength="10" required>
+    <button type="submit">Create admin</button>
+  </form>
+</div>
+{% endblock %}

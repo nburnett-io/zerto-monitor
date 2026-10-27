@@ -1,0 +1,222 @@
+#!/usr/bin/python3
+"""Keep the deploy wizard's passwords out of the running appliance.
+
+vCenter hands the vApp properties to the VM as guestinfo.ovfEnv at EVERY power-on,
+and any local account - even 'nobody' - can read that back with vmware-rpctool.
+cloud-init also pickles a copy into /var/lib/cloud. Once first boot has applied
+them nothing needs those values again, so this:
+
+  * blanks every secret-bearing property (and the bulky install payload) in the
+    guest's runtime copy of guestinfo.ovfEnv, then reads it back to prove it
+  * deletes cloud-init's cached copies
+  * ejects the ISO-transport disc vCenter re-attaches at power-on
+
+It cannot reach vCenter's own copy - the VM's vApp properties. It records WHICH
+properties vCenter still fills in (names only, never values) in STATE, so the admin
+page can say "clear these in vCenter". A guest reboot keeps our blanked copy (only a
+power-on brings vCenter's), so the record is only replaced when a fresh copy from
+vCenter is seen - recognisable because it still carries the install payload.
+
+Only acts once cloud-init is disabled (first boot does that when it finishes):
+cloud-init re-reads the environment at boot, and finding it blank would make it treat
+the VM as a new instance - regenerating SSH host keys among other things.
+
+Runs at boot, every 30 minutes (zerto-monitor-ovfscrub.timer) and from firstboot.
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+STATE = Path("/var/lib/zerto-monitor/ovfenv.state")
+CLOUD_INIT_OFF = Path("/etc/cloud/cloud-init.disabled")
+SECRET = re.compile(r"pass|secret|token|community|private|^zm-zvm-user$", re.I)
+BULK = re.compile(r"^(zm-payload\d+|user-data)$")
+# A Property element, attribute by attribute: quoted values may legally contain '>'
+_ATTR = r"""\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*')"""
+ELEMENT = re.compile(rf"<(?:[\w.-]+:)?Property\b(?:{_ATTR})*\s*/?>", re.S)
+KEY = re.compile(r"""\s(?:[\w.-]+:)?key\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+VALUE = re.compile(r"""\s(?:[\w.-]+:)?value\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+CACHES = ("/var/lib/cloud/instances/*/obj.pkl", "/var/lib/cloud/instance/obj.pkl",
+          "/var/lib/cloud/instance/ovf-env.xml", "/var/lib/cloud/seed/ovf/ovf-env.xml",
+          "/run/cloud-init/ovf-env.xml")
+
+
+def properties(xml: str) -> dict[str, str] | None:
+    """Every property by real XML parsing - the independent check on scrub()'s regex
+    rewrite. None if the document doesn't parse."""
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+    out: dict[str, str] = {}
+    for el in root.iter():
+        if not (el.tag.endswith("}Property") or el.tag == "Property"):
+            continue
+        k = v = None
+        for an, av in el.attrib.items():
+            if an.endswith("}key") or an == "key":
+                k = av
+            elif an.endswith("}value") or an == "value":
+                v = av
+        if k is not None:
+            out[k] = v or ""
+    return out
+
+
+def held_secrets(props: dict[str, str]) -> list[str]:
+    return sorted(k for k, v in props.items() if v and SECRET.search(k))
+
+
+def iso_env() -> str | None:
+    """The environment on the ISO transport, if vCenter attached one this power-on.
+    None = no media; "" = media present but unreadable; else the ovf-env.xml text."""
+    import tempfile
+    devs = []
+    for d in sorted(Path("/dev").glob("sr*")):
+        try:
+            if int((Path("/sys/block") / d.name / "size").read_text().strip() or 0) > 0:
+                devs.append(d)
+        except (OSError, ValueError):
+            continue
+    if not devs:
+        return None
+    mnt = Path(tempfile.mkdtemp(prefix="zm-ovfiso-"))
+    try:
+        for d in devs:
+            if subprocess.run(["mount", "-o", "ro,mode=0400,dmode=0500", str(d), str(mnt)],
+                              capture_output=True).returncode == 0:
+                try:
+                    f = next(mnt.glob("**/ovf-env.xml"), None)
+                    if f:
+                        return f.read_text(errors="replace")
+                finally:
+                    subprocess.run(["umount", str(mnt)], capture_output=True)
+        return ""
+    finally:
+        try:
+            mnt.rmdir()
+        except OSError:
+            pass
+
+
+def scrub(xml: str) -> str:
+    """The environment with every secret and bulk value emptied, everything else
+    byte-for-byte. Pure function - unit-tested; verified with properties() after."""
+    def fix(m: re.Match) -> str:
+        el = m.group(0)
+        k, v = KEY.search(el), VALUE.search(el)
+        if not k or not v:
+            return el
+        key = k.group(1) if k.group(1) is not None else k.group(2)
+        g = 1 if v.group(1) is not None else 2
+        if not v.group(g) or not (SECRET.search(key) or BULK.match(key)):
+            return el
+        return el[:v.start(g)] + el[v.end(g):]
+
+    return ELEMENT.sub(fix, xml)
+
+
+def rpc(arg: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["vmware-rpctool", arg], capture_output=True, text=True, timeout=30)
+
+
+def read_state() -> dict:
+    out = {}
+    try:
+        for ln in STATE.read_text().splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    prev = read_state()
+    held = set(filter(None, prev.get("held", "").split(",")))
+    source, result = prev.get("source", "unknown"), "skipped-cloud-init-enabled"
+
+    if CLOUD_INIT_OFF.exists():
+        try:
+            got = rpc("info-get guestinfo.ovfEnv")
+            env = got.stdout if got.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            env = ""
+        props = properties(env) if "<Environment" in env else None
+        if "<Environment" not in env:
+            # nothing in guestinfo - but vCenter may have used the ISO transport instead
+            iso = iso_env()
+            if iso is None:
+                held, source, result = set(), "none", "absent"
+            elif iso == "" or properties(iso) is None:
+                source, result = "iso", "unknown"         # can't tell: the admin page must not say OK
+            else:
+                held, source, result = set(held_secrets(properties(iso))), "iso", "iso-only"
+        elif props is None:
+            result = "error-unparseable"
+        else:
+            found = held_secrets(props)
+            fresh = any(v for k, v in props.items() if BULK.match(k))
+            if fresh:                              # vCenter's own copy: authoritative
+                held, source = set(found), "vcenter"
+            else:                                  # our blanked copy, kept over a reboot
+                held |= set(found)
+            if not found and not fresh:
+                result = "clean"
+            else:
+                clean = scrub(env)
+                check = properties(clean)
+                # never hand back anything secret, nor a document that lost a property
+                if check is None or held_secrets(check) or set(check) != set(props):
+                    result = "error-scrub-incomplete"
+                else:
+                    try:
+                        ok = rpc("info-set guestinfo.ovfEnv " + clean).returncode == 0
+                        after = properties(rpc("info-get guestinfo.ovfEnv").stdout or "")
+                    except (OSError, subprocess.SubprocessError):
+                        ok, after = False, None
+                    # 'unsupported': isolation.tools.setinfo.disable is set on this VM
+                    result = "scrubbed" if ok and after is not None and not held_secrets(after) \
+                        else "unsupported"
+
+    removed = 0
+    if CLOUD_INIT_OFF.exists():
+        for pattern in CACHES:
+            for p in glob.glob(pattern):
+                try:
+                    if os.path.isfile(p) and not os.path.islink(p):
+                        os.unlink(p)
+                        removed += 1
+                except OSError:
+                    pass
+    for dev in sorted(Path("/dev").glob("sr*")):
+        subprocess.run(["eject", str(dev)], capture_output=True)
+
+    lines = {
+        "checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "guest": result,
+        "source": source,
+        "held": ",".join(sorted(held)),           # property NAMES only - never values
+        "cache_removed": str(removed),
+    }
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.parent.chmod(0o755)
+    tmp = STATE.with_suffix(".new")
+    tmp.write_text("".join(f"{k}={v}\n" for k, v in lines.items()))
+    tmp.chmod(0o644)
+    tmp.replace(STATE)
+    print(f"ovfenv guest={result} vcenter_still_holds={lines['held'] or 'nothing'} "
+          f"cache_files_removed={removed}")
+    return 1 if result.startswith("error") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 32" width="176" height="32">
+  <path d="M16 2 28 6v9c0 7.5-5.2 13-12 15C9.2 28 4 22.5 4 15V6z" fill="#1b75bc"/>
+  <g fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round">
+    <path d="M10.69 15.08A5.5 5.5 0 0 1 21.17 14.62"/>
+    <path d="M21.31 17.92A5.5 5.5 0 0 1 10.83 18.38"/>
+  </g>
+  <g fill="#fff">
+    <path d="M21.92 16.69 22.86 14 19.48 15.24z"/>
+    <path d="M10.08 16.31 9.14 19 12.52 17.76z"/>
+  </g>
+  <text x="38" y="22" fill="#fff" font-family="'Source Sans 3','Segoe UI',system-ui,Arial,sans-serif" font-size="17" font-weight="600" letter-spacing=".3">Zerto Monitor</text>
+</svg>

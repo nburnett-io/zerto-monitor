@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DR report · {{ r.zorg }} · {{ r.month }}</title>
+<link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+<style>
+/* Standalone and print-ready: the same document is the web page and the PDF (WeasyPrint). */
+@page { size: Letter; margin: 16mm 14mm 18mm 14mm;
+  @bottom-left { content: "Zerto Monitor ·{{ r.zorg }} · {{ r.month }}"; font: 8pt sans-serif; color: #8791A1; }
+  @bottom-right { content: "page " counter(page) " of " counter(pages); font: 8pt sans-serif; color: #8791A1; } }
+:root { --navy:#0d1b2a; --blue:#1b75bc; --ink:#1B2028; --muted:#5C6675; --rule:#D9DEE7; --soft:#F2F5F9;
+        --fail:#B4413C; --warn:#97691F; --good:#34694D; }
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); background: #fff; font: 10.5pt/1.45 "Source Sans 3", "Segoe UI", "DejaVu Sans", Arial, sans-serif; }
+.page { max-width: 210mm; margin: 0 auto; padding: 0 0 24px; }
+.toolbar { position: sticky; top: 0; background: var(--navy); color: #cfe0f3; padding: 8px 16px; display: flex; gap: 14px; align-items: center; font-size: 10pt; }
+.toolbar a { color: #fff; } .toolbar .err { color: #ffb4ae; }
+header { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 3px solid var(--blue); padding: 18px 0 10px; margin-bottom: 14px; }
+header img { height: 34px; vertical-align: middle; } header .brand { font-size: 14pt; font-weight: 600; color: var(--navy); margin-left: 8px; vertical-align: middle; }
+header .t { text-align: right; } header .t b { font-size: 16pt; color: var(--navy); display: block; } header .t span { color: var(--muted); font-size: 9.5pt; }
+h2 { font-size: 11pt; text-transform: uppercase; letter-spacing: .08em; color: var(--navy); border-bottom: 1px solid var(--rule); padding-bottom: 3px; margin: 18px 0 8px; break-after: avoid; }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--rule); border: 1px solid var(--rule); margin: 8px 0 6px; }
+.kpis div { background: #fff; padding: 8px 10px; } .kpis .k { font-size: 7.5pt; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.kpis .v { font-size: 15pt; font-weight: 700; } .good { color: var(--good); } .warn { color: var(--warn); } .fail { color: var(--fail); }
+table { width: 100%; border-collapse: collapse; font-size: 9pt; margin: 4px 0 8px; }
+th { text-align: left; font-size: 7.5pt; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); background: var(--soft); padding: 4px 6px; border-bottom: 1px solid var(--rule); }
+td { padding: 4px 6px; border-bottom: 1px solid var(--rule); vertical-align: top; } td.n { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+tr { break-inside: avoid; }
+thead { display: table-header-group; }
+h2 + table, h2 + p + table { break-before: avoid; }
+.tag { display: inline-block; font-size: 7pt; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; padding: 1px 5px; border-radius: 2px; }
+.tag.ok { background: #E2EFE8; color: var(--good); } .tag.fail { background: #F7E7E5; color: var(--fail); } .tag.warn { background: #F8EFDC; color: var(--warn); } .tag.info { background: #E6EBF4; color: #3A4F7A; }
+.note { border-left: 3px solid var(--warn); background: #FBF5E8; padding: 6px 10px; font-size: 9pt; margin: 6px 0; }
+.small { color: var(--muted); font-size: 8.5pt; }
+.chart { border: 1px solid var(--rule); padding: 6px 8px; margin: 6px 0; break-inside: avoid; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media print { .toolbar { display: none; } }
+@media (max-width: 700px) { .kpis { grid-template-columns: repeat(2, 1fr); } .two { grid-template-columns: 1fr; } .page { padding: 0 12px 24px; } }
+</style>
+</head>
+<body>
+{% if not pdf %}<div class="toolbar"><a href="/reports">← reports</a><a href="/zorgs/{{ r.zorg|urlencode }}">{{ r.zorg }}</a>
+  <a href="/reports/{{ r.zorg|urlencode }}/{{ r.month }}/pdf"><b>Download PDF</b></a><span>or Print → Save as PDF</span>
+  {% if err %}<span class="err">{{ err }}</span>{% endif %}</div>{% endif %}
+<div class="page">
+<header>
+  <div><img src="{{ r.logo }}" alt=""><span class="brand">Zerto Monitor</span></div>
+  <div class="t"><b>Disaster recovery report</b><span>{{ r.zorg }} · {{ r.start.strftime('%B %Y') }}</span></div>
+</header>
+
+{% set t = r.total %}
+<div class="kpis">
+  <div><div class="k">RPO met</div><div class="v {{ 'good' if (t.rpo_ok_pct or 0) >= 99 else ('warn' if (t.rpo_ok_pct or 0) >= 95 else 'fail') }}">{{ t.rpo_ok_pct if t.samples else '—' }}{{ '%' if t.samples }}</div><div class="small">of samples within the target</div></div>
+  <div><div class="k">Journal history met</div><div class="v {{ 'good' if (t.hist_ok_pct or 0) >= 99 else 'warn' }}">{{ t.hist_ok_pct if t.samples else '—' }}{{ '%' if t.samples }}</div><div class="small">point-in-time history kept</div></div>
+  <div><div class="k">Healthy</div><div class="v {{ 'good' if (t.healthy_pct or 0) >= 99 else 'warn' }}">{{ t.healthy_pct if t.samples else '—' }}{{ '%' if t.samples }}</div><div class="small">of samples, all VPGs</div></div>
+  <div><div class="k">Failover tests</div><div class="v {{ 'good' if r.tests_ok else 'warn' }}">{{ r.tests|selectattr('rtype', 'equalto', 'FailoverTest')|list|length }}</div><div class="small">{{ r.tests_ok }} passed{{ ', %d failed' % r.tests_failed if r.tests_failed }}</div></div>
+  <div><div class="k">VPGs · VMs</div><div class="v">{{ r.summary.vpgs }} · {{ r.summary.vms }}</div><div class="small">protected now</div></div>
+  <div><div class="k">Protected storage</div><div class="v">{{ r.summary.prov_tb }}<span class="small"> TiB</span></div><div class="small">{{ r.summary.used_tb }} TiB used</div></div>
+  <div><div class="k">Average · worst RPO</div><div class="v">{{ (t.rpo_avg or 0)|age if t.samples else '—' }}<span class="small"> · {{ (t.rpo_max or 0)|age if t.samples else '' }}</span></div><div class="small">seconds of data at risk</div></div>
+  <div><div class="k">Sites</div><div class="v" style="font-size:10pt">{{ r.summary.sites|join(', ') }}</div></div>
+</div>
+{% if r.coverage.partial %}<div class="note">Compliance figures cover {{ r.coverage.days }} day{{ '' if r.coverage.days == 1 else 's' }} of this month{% if r.coverage.first %} ({{ r.coverage.first }} to {{ r.coverage.last }}){% endif %} - the monitor's hourly recording started {{ r.coverage.first or 'after this month' }}.</div>{% endif %}
+
+{% if r.rpo_chart %}
+<h2>Recovery point by day</h2>
+<div class="chart">{{ r.rpo_chart }}</div>
+<div class="chart"><div class="small">Share of samples healthy, by day</div>{{ r.health_chart }}</div>
+{% endif %}
+
+<h2>Protection groups</h2>
+{% if r.rows %}
+<table><thead><tr><th>VPG</th><th class="n">RPO target</th><th class="n">RPO met</th><th class="n">Avg / worst RPO</th><th class="n">History met</th><th class="n">Healthy</th><th>Last test</th></tr></thead>
+{% for v in r.rows %}<tr><td>{{ v.name }}{% if not v.still_protected %} <span class="tag warn">removed</span>{% endif %}</td><td class="n">{{ v.rpo_cfg|age }}</td>
+  <td class="n {{ 'good' if v.rpo_ok_pct >= 99 else ('warn' if v.rpo_ok_pct >= 95 else 'fail') }}">{{ v.rpo_ok_pct }}%</td>
+  <td class="n">{{ v.rpo_avg|age }} / {{ v.rpo_max|age }}</td><td class="n">{{ v.hist_ok_pct }}%</td><td class="n">{{ v.healthy_pct }}%</td><td>{{ v.last_test or 'never' }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="small">No samples recorded for this month.</p>{% endif %}
+
+<h2>Failover tests and recoveries</h2>
+{% if r.tests %}
+<table><thead><tr><th>Date (UTC)</th><th>VPG</th><th>Type</th><th>Result</th><th class="n">RTO</th><th>By</th><th>Notes</th></tr></thead>
+{% for x in r.tests %}<tr><td>{{ x.started[:16].replace('T', ' ') }}</td><td>{{ x.vpg_name }}</td><td>{{ x.rtype }}</td>
+  <td><span class="tag {{ 'ok' if x.ok else ('fail' if x.ok == false else 'info') }}">{{ x.status }}</span></td><td class="n">{{ x.rto_h }}</td><td>{{ x.by_user }}</td><td class="small">{{ x.notes }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="small">No failover test this month.</p>{% endif %}
+{% if r.never_tested or r.stale_tested %}<div class="note">{% if r.never_tested %}<b>Never tested:</b> {{ r.never_tested|join(', ') }}. {% endif %}{% if r.stale_tested %}<b>Last tested over 90 days ago:</b> {{ r.stale_tested|join(', ') }}.{% endif %}</div>{% endif %}
+
+<h2>DR failover plan</h2>
+{% if r.plans.plans %}
+{% for p in r.plans.plans %}<p><b>{{ p.name }}</b> at {{ p.site }} - <span class="tag {{ 'ok' if p.status in ('Ready', 'Completed') else ('fail' if p.status == 'Error' else 'info') }}">{{ p.status }}</span>
+  {% if p.last_ok %}<span class="small">last successful run {{ p.last_ok[:10] }}</span>{% endif %}<br>
+  {% for tier in p.tiers %}<span class="small">{{ loop.index }}. {{ tier.vpgs|join(', ') }}{% if tier.after %} → {{ tier.after|join(', ') }}{% endif %}</span><br>{% endfor %}</p>{% endfor %}
+{% for site, gaps in r.plans.missing.items() %}<div class="note">Not in any plan at {{ site }}: {{ gaps|join(', ') }}.</div>{% endfor %}
+{% else %}<p class="small">No recovery plan defines the order {{ r.zorg }}'s VPGs fail over in.</p>{% endif %}
+
+<h2>Changes, pauses and operations</h2>
+{% if r.events %}
+<p class="small">{% for k, n in r.event_counts.items() %}{{ n }} {{ r.kind_label.get(k, k) }}{{ ' · ' if not loop.last }}{% endfor %}</p>
+<table><thead><tr><th>When (UTC)</th><th>What</th><th>VPG</th><th>By</th><th>Detail</th></tr></thead>
+{% for e in r.events[:60] %}<tr><td>{{ e.at[:16].replace('T', ' ') }}</td><td>{{ r.kind_label.get(e.kind, e.kind) }}</td><td>{{ e.vpg_names|join(', ') }}</td><td>{{ e.user or '' }}</td><td class="small">{{ e.text }}</td></tr>{% endfor %}
+</table>{% if r.events|length > 60 %}<p class="small">{{ r.events|length - 60 }} more in the monitor's timeline.</p>{% endif %}
+{% else %}<p class="small">No changes, pauses or operations recorded this month.</p>{% endif %}
+
+<h2>Alerts</h2>
+{% if r.alerts %}
+<table><thead><tr><th>When (UTC)</th><th>Event</th><th>Level</th><th>Summary</th></tr></thead>
+{% for a in r.alerts %}<tr><td>{{ a.at[:16].replace('T', ' ') }}</td><td>{{ a.event }}</td><td>{{ a.level or '' }}</td><td class="small">{{ a.summary }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="small">No alert was raised for {{ r.zorg }} this month.</p>{% endif %}
+
+<h2>Open issues at {{ r.generated.strftime('%Y-%m-%d %H:%M') }} UTC</h2>
+{% if r.open_issues %}
+<table><thead><tr><th>VPG</th><th>State</th><th>Why</th></tr></thead>
+{% for v in r.open_issues %}<tr><td>{{ v.name }}</td><td><span class="tag {{ 'fail' if v.health == 'failure' else 'warn' }}">{{ v.health }}</span></td><td class="small">{{ v.why }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="small">None - every VPG is healthy.</p>{% endif %}
+
+<h2>Configuration backups</h2>
+<p class="small">{% if r.backups.latest %}The settings of {{ r.backups.vpgs }} VPG{{ '' if r.backups.vpgs == 1 else 's' }} are backed up daily, off the replication appliances, and kept {{ r.backups.days }} days; the latest backup is from {{ r.backups.latest[:16].replace('T', ' ') }} UTC.{% else %}No configuration backup is stored yet.{% endif %}</p>
+
+<p class="small" style="margin-top:22px">Prepared with Zerto Monitor,{{ r.generated.strftime('%Y-%m-%d %H:%M') }} UTC. RPO is how far behind the replica is - the data that would be lost in a disaster at that moment. RTO is how long a recovery took in a test.</p>
+</div>
+</body>
+</html>

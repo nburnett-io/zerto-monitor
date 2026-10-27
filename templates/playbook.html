@@ -1,0 +1,69 @@
+{% extends "base.html" %}{% block title %}Playbook · Zerto Monitor{% endblock %}
+{% block body %}{% set eng = user and user.can_operate %}
+<h1>Playbook</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<p class="small" style="max-width:60rem">What the <b>Suggested fix</b> column draws on. <b>Researched</b> entries ship with the monitor (written from Zerto's
+  alert reference and reviewed for safety). <b>Team</b> entries are written here by engineers when they find what actually fixes an error. They show first,
+  with the author and date. Placeholders {% for p in placeholders %}<code>{{ '{' ~ p ~ '}' }}</code>{{ ', ' if not loop.last }}{% endfor %} are filled in
+  from the alert text wherever the fix is shown.</p>
+
+{% if eng %}
+<h2 id="add">Add a team fix</h2>
+<form method="post" action="/admin/playbook" class="card pbform-wide">
+  <input type="hidden" name="back" value="/playbook">
+  <div class="formrow" style="max-width:70rem;grid-template-columns:minmax(10rem,14rem) 1fr">
+    <label>Alert code or condition
+      <input name="key" required list="pbkeys" value="{{ prefill }}" placeholder="VPG0035 or cond:rpo-over-target" pattern="[A-Za-z]{2,6}[0-9]{3,5}|(cond|sub|status):[A-Za-z\-]{3,40}"></label>
+    <label>Title <span class="small">(optional)</span><input name="title" maxlength="{{ limits.title }}" placeholder="short name for the problem"></label>
+  </div>
+  <label style="display:block;margin:.5rem 0">What fixed it
+    <textarea name="fix" rows="4" maxlength="{{ limits.fix }}" required style="width:100%" placeholder="Steps that worked, in order. Links are fine."></textarea></label>
+  <label style="display:block;margin:.5rem 0">Caution <span class="small">(optional: anything that can resync, lose checkpoints or fail over)</span>
+    <input name="caution" maxlength="{{ limits.caution }}" style="width:100%"></label>
+  <button type="submit">Save team fix</button>
+  <datalist id="pbkeys">{% for e in entries %}<option value="{{ e.key }}">{{ e.title }}</option>{% endfor %}{% for k, d in conditions.items() %}<option value="{{ k }}">{{ d }}</option>{% endfor %}</datalist>
+  <p class="small" style="margin-bottom:0">File it under the alert's code (as shown in the ID column, e.g. <code>VPG0035</code>), or a replication condition:
+    {% for k, d in conditions.items() %}<code>{{ k }}</code> ({{ d }}){{ ', ' if not loop.last }}{% endfor %}, <code>sub:&lt;Substatus&gt;</code> or <code>status:&lt;Status&gt;</code>.</p>
+</form>
+{% endif %}
+
+<h2>Entries <span class="small">({{ entries|length }})</span></h2>
+<input id="pbfilter" type="search" placeholder="filter by code, title or text…" style="max-width:24rem;margin-bottom:.6rem" aria-label="filter the playbook">
+<div class="scroll"><table id="pbtable">
+  <tr><th>Key</th><th>Researched</th><th>Team fixes</th></tr>
+  {% for e in entries %}
+  <tr id="k-{{ e.key }}" class="pbrow">
+    <td class="mono name">{{ e.key }}{% if e.title %}<div class="small" style="font-family:inherit">{{ e.title }}</div>{% endif %}{% if e.condition %}<div class="small" style="font-family:inherit">{{ e.condition }}</div>{% endif %}</td>
+    <td class="fix">{% if e.researched %}{% if e.researched.meaning %}<div class="small" style="margin-bottom:.2rem">{{ e.researched.meaning }}</div>{% endif %}{{ e.researched.fix|linkify }}{% if e.researched.caution %}<span class="caution">⚠ {{ e.researched.caution|linkify }}</span>{% endif %}
+      <div class="small" style="margin-top:.2rem">{% if e.researched.self_clears %}clears by itself: {{ e.researched.self_clears }}{% endif %}{% if e.researched.confidence %} · confidence {{ e.researched.confidence }}{% endif %}</div>
+      {% if e.researched.source %}<details class="ignore"><summary>sources</summary><div class="small">{{ e.researched.source|linkify }}</div></details>{% endif %}
+      {% else %}<span class="small">—</span>{% endif %}</td>
+    <td class="fix">
+      {% for t in e.team %}
+      <div class="fx team">{% if t.title %}<b>{{ t.title }}</b> — {% endif %}{{ t.fix|linkify }}{% if t.caution %}<span class="caution">⚠ {{ t.caution|linkify }}</span>{% endif %}
+        <span class="by">{{ t.updated_by or t.created_by }}, {{ ((t.updated_at or t.created_at) or '')[:10] }}</span>
+        {% if eng %}
+        <details class="ignore"><summary>edit / delete</summary>
+          <form method="post" action="/admin/playbook/{{ t.id }}" class="pbform">
+            <input type="hidden" name="back" value="/playbook#k-{{ e.key }}">
+            <label>Key<input name="key" value="{{ t.key }}" required></label>
+            <label>Title<input name="title" value="{{ t.title or '' }}" maxlength="{{ limits.title }}"></label>
+            <label>Fix<textarea name="fix" rows="4" maxlength="{{ limits.fix }}" required>{{ t.fix }}</textarea></label>
+            <label>Caution<input name="caution" value="{{ t.caution or '' }}" maxlength="{{ limits.caution }}"></label>
+            <span><button type="submit">Save</button></span>
+          </form>
+          <form class="inline" method="post" action="/admin/playbook/{{ t.id }}/delete" onsubmit="return confirm('Delete this team fix?')"><input type="hidden" name="back" value="/playbook"><button class="danger" type="submit">Delete</button></form>
+        </details>
+        {% endif %}
+      </div>
+      {% else %}{% if eng %}<a class="small" href="/playbook?key={{ e.key|urlencode }}#add">+ add one</a>{% else %}<span class="small">—</span>{% endif %}{% endfor %}
+    </td>
+  </tr>
+  {% else %}<tr><td colspan="3" class="small">No entries yet.</td></tr>{% endfor %}
+</table></div>
+<script>
+(function(){var f=document.getElementById('pbfilter');if(!f)return;
+  f.addEventListener('input',function(){var q=f.value.toLowerCase();
+    document.querySelectorAll('#pbtable tr.pbrow').forEach(function(r){r.style.display=!q||r.textContent.toLowerCase().indexOf(q)>=0?'':'none';});});})();
+</script>
+{% endblock %}

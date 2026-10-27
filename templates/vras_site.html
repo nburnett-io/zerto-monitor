@@ -1,0 +1,171 @@
+{% extends "base.html" %}{% block title %}{{ site }} VRAs · Zerto Monitor{% endblock %}
+{% set autorefresh = 60 %}
+{% block body %}{% import "_fix.html" as fx %}{% set here = '/vras/' ~ (site|urlencode) %}{% set admin = user and user.can_operate %}
+<p class="small"><a href="/vras">← all sites</a></p>
+<h1>{{ site }} — VRAs</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<div class="strip">
+  <div class="cell"><div class="k">Site health</div><div class="v {{ 'fail' if counts.health == 'failure' else ('warn' if counts.health == 'warning' else 'good') }}">{{ counts.health|upper }}</div></div>
+  <div class="cell"><div class="k">VRAs</div><div class="v">{{ counts.total }}</div></div>
+  <div class="cell"><div class="k">Clusters</div><div class="v">{{ clusters|length }}</div></div>
+  <div class="cell"><div class="k">Disconnected</div><div class="v {{ 'fail' if counts.disconnected else 'good' }}">{{ counts.disconnected }}</div></div>
+  <div class="cell"><div class="k">Mask drift</div><div class="v {{ 'warn' if counts.mask_mismatch else 'good' }}">{{ counts.mask_mismatch }}</div></div>
+  <div class="cell"><div class="k">Status ≠ OK</div><div class="v {{ 'warn' if counts.not_ok else 'good' }}">{{ counts.not_ok }}</div></div>
+  <div class="cell"><div class="k"><a href="#sizing">Sizing</a></div>
+    {% if standard or sizing.unset < counts.total %}<div class="v {{ 'warn' if (sizing.under or sizing.mixed) else 'good' }}">{{ sizing.ok }}/{{ counts.total }}</div><div class="small">at their target size</div>
+    {% else %}<div class="v" style="font-size:1rem">not set</div>{% endif %}</div>
+</div>
+
+<h2 id="sizing">Site sizing standard</h2>
+<div class="card">
+  {% if standard %}
+  <p style="margin-top:0"><b>{{ standard.memory_gb }} GB · {{ standard.cpus }} vCPU</b>
+    {% if standard.support_ref %}&nbsp;<span class="tag info" title="Zerto case / change reference">ref {{ standard.support_ref }}</span>{% endif %}
+    <span class="small">&nbsp;set by {{ standard.updated_by }} {{ (standard.updated_at or '')[:16].replace('T', ' ') }}{% if standard.note %} — {{ standard.note }}{% endif %}</span></p>
+  {% else %}
+  <p style="margin-top:0">No site standard for {{ site }} yet.{% if common %} The most common size here is <b>{{ common.memory_gb }} GB / {{ common.cpus }} vCPU</b> ({{ common.count }} of {{ counts.total }} VRAs).{% endif %}</p>
+  {% endif %}
+  <p class="small">{{ sizing.ok }} at target · {{ sizing.under }} below{% if sizing.mixed %} · {{ sizing.mixed }} mixed{% endif %} · {{ sizing.over }} above · {{ sizing.pinned }} pinned{% if sizing.pushable %} · <b>{{ sizing.pushable }}</b> would change if resized{% endif %}.
+    A VRA's target is its <b>pin</b>, else its <b>cluster override</b>, else this <b>site standard</b>.</p>
+  {% if admin %}
+  <form method="post" action="/admin/vras/standard">
+    <input type="hidden" name="site" value="{{ site }}"><input type="hidden" name="back" value="{{ here }}#sizing">
+    <div class="formrow" style="max-width:60rem">
+      <label>Memory (GB)<input type="number" name="memory_gb" min="1" max="{{ mem_max }}" required
+             value="{{ standard.memory_gb if standard else (common.memory_gb if common else 8) }}"></label>
+      <label>vCPUs<input type="number" name="cpus" min="1" max="{{ cpu_max }}" required
+             value="{{ standard.cpus if standard else (common.cpus if common else 2) }}"></label>
+      <label>Zerto case / ref <span class="small">(needed above 16 GB or 4 vCPU)</span><input name="support_ref" maxlength="60" value="{{ standard.support_ref if standard and standard.support_ref else '' }}"></label>
+      <label>Note<input name="note" maxlength="300" value="{{ standard.note if standard else '' }}" placeholder="why this size"></label>
+      <span><button type="submit">{{ 'Update' if standard else 'Set' }} site standard</button></span>
+    </div>
+  </form>
+  {% if standard %}<form class="inline" method="post" action="/admin/vras/standard/delete"><input type="hidden" name="site" value="{{ site }}"><input type="hidden" name="back" value="{{ here }}#sizing"><button class="ghost" type="submit">Clear site standard</button></form>{% endif %}
+  <p class="small">A standard only ever <b>raises</b> a VRA. Lowering is chosen per resize, on its preview, by an admin. Bounds are 1-{{ mem_max }} GB and 1-{{ cpu_max }} vCPU. Beyond Zerto's 16 GB / 4 vCPU guidance a rule needs a Zerto case reference, and more than 2 vCPU is "only per Zerto Support recommendation". To keep one VRA at its own size, pin it.</p>
+  {% endif %}
+  {% if not allow_changes %}<p class="small" style="margin-bottom:0">Resizing is <b>off</b> for this site: the monitor stays read-only on its ZVM until an admin arms it (Admin → VRA resizing). The Resize… previews still show what a resize would involve.</p>{% endif %}
+</div>
+
+<h2>VRAs by cluster</h2>
+{% for cl in clusters %}{% set ov = cl.override %}{% set ci = loop.index %}
+<div class="cluster" id="cl-{{ ci }}">
+  <div class="clhead">
+    <b>{{ cl.name }}</b>
+    <span class="small">{{ cl.counts.total }} VRAs · {{ cl.counts.ok }} at target{% if cl.counts.below %} · <b>{{ cl.counts.below }} below</b>{% endif %}</span>
+    {% if ov %}<span class="tag info" title="set by {{ ov.updated_by }}{% if ov.note %}: {{ ov.note }}{% endif %}">override {{ ov.memory_gb }}G / {{ ov.cpus }} vCPU{{ ' · ref ' ~ ov.support_ref if ov.support_ref }}</span>
+    {% elif standard %}<span class="small">follows the site standard</span>{% endif %}
+    {% if admin %}
+    <details class="ignore" style="display:inline-block;margin-left:.6rem"><summary>{{ 'edit override' if ov else 'override for this cluster' }}</summary>
+      <form method="post" action="/admin/vras/cluster-standard" class="formrow" style="margin:.4rem 0;grid-template-columns:repeat(auto-fit,minmax(8rem,1fr))">
+        <input type="hidden" name="site" value="{{ site }}"><input type="hidden" name="cluster" value="{{ cl.name }}"><input type="hidden" name="back" value="{{ here }}#cl-{{ ci }}">
+        <label>Memory (GB)<input type="number" name="memory_gb" min="1" max="{{ mem_max }}" required value="{{ ov.memory_gb if ov else (cl.common.memory_gb if cl.common else 8) }}"></label>
+        <label>vCPUs<input type="number" name="cpus" min="1" max="{{ cpu_max }}" required value="{{ ov.cpus if ov else (cl.common.cpus if cl.common else 2) }}"></label>
+        <label>Zerto ref<input name="support_ref" maxlength="60" value="{{ ov.support_ref if ov and ov.support_ref else '' }}" placeholder="above 16 GB / 4 vCPU"></label>
+        <label>Note<input name="note" maxlength="300" value="{{ ov.note if ov else '' }}" placeholder="why this cluster differs"></label>
+        <span><button type="submit">Save override</button></span>
+      </form>
+      {% if ov %}<form class="inline" method="post" action="/admin/vras/cluster-standard/delete"><input type="hidden" name="site" value="{{ site }}"><input type="hidden" name="cluster" value="{{ cl.name }}"><input type="hidden" name="back" value="{{ here }}#cl-{{ ci }}"><button class="ghost" type="submit">Remove override</button></form>{% endif %}
+    </details>
+
+    {% endif %}
+  </div>
+  <div class="scroll"><table>
+    <tr><th>Host</th><th class="c2">IP</th><th class="c1">Mask</th><th class="c3">GW</th><th class="c2">Ver</th><th class="num">Mem</th><th class="num">CPU</th><th>Sizing</th><th class="num c3">Prot VPG/vol</th><th class="num c2">Rec VPG/vol</th><th class="c3">Datastore</th><th>State</th></tr>
+    {% for r in cl.vras %}{% set z = r.sizing %}
+    <tr class="{{ 'failure' if r.disconnected else ('warning' if r.mask_mismatch or r.status != 0 else '') }}">
+      <td class="name">{{ r.host }}</td>
+      <td class="mono c2">{{ r.ip }}</td>
+      <td class="mono c1">{{ r.mask }}{% if r.mask_mismatch %}<div class="why">expected {{ r.mask_expected }}</div>{% endif %}</td>
+      <td class="mono c3">{{ r.gw }}</td>
+      <td class="mono c2">{{ r.version }}{% if versions|length > 1 and r.version != versions[-1] %} <span class="tag warning">behind</span>{% endif %}</td>
+      <td class="num">{{ r.mem_gb }}G</td><td class="num">{{ r.cpus }}</td>
+      <td>
+        {% if z.state == 'unset' %}<span class="small">—</span>
+        {% else %}
+          <span class="tag {{ 'ok' if z.state == 'ok' else ('warning' if z.state in ('under', 'mixed') else 'info') }}">{{ {'ok': 'at target', 'under': 'below', 'over': 'above', 'mixed': 'mixed'}[z.state] }}</span>
+          {% if z.pinned %}<span class="tag info" title="pinned at its own size">pinned {{ z.target_mem }}G/{{ z.target_cpus }}</span>{% elif z.source == 'cluster' %}<span class="small">(cluster)</span>{% endif %}
+          {% if z.push %}<div class="small">→ {{ z.push_mem }}G / {{ z.push_cpus }} vCPU</div>{% elif z.state in ('under', 'mixed') and z.blocked %}<div class="small">not resizable now</div>{% endif %}
+          {% for fl in z.flags if fl in ('version_lag', 'unhealthy', 'maintenance', 'no_id') %}<span class="tag warning" title="blocks a resize">{{ fl.replace('_', ' ') }}</span> {% endfor %}
+        {% endif %}
+        {% if admin %}<div class="acts">
+          {% if z.push or z.can_lower %}<a class="btn{{ '' if z.push else ' ghost' }}" href="{{ here }}/resize?key={{ r.key|urlencode }}{{ '' if z.push else '&lower=1' }}" title="preview: a resize power-cycles this VRA">{{ 'Resize…' if z.push else 'Lower…' }}</a>{% endif %}
+          {% if z.pinned %}<form class="inline" method="post" action="/admin/vras/pin/delete"><input type="hidden" name="key" value="{{ r.key }}"><input type="hidden" name="back" value="{{ here }}#cl-{{ ci }}"><button class="ghost mini" type="submit">unpin</button></form>
+          {% elif z.state != 'ok' and z.state != 'unset' %}<form class="inline" method="post" action="/admin/vras/pin"><input type="hidden" name="site" value="{{ site }}"><input type="hidden" name="key" value="{{ r.key }}"><input type="hidden" name="host" value="{{ r.host }}"><input type="hidden" name="memory_gb" value="{{ r.mem_gb }}"><input type="hidden" name="cpus" value="{{ r.cpus }}"><input type="hidden" name="back" value="{{ here }}"><button class="ghost mini" type="submit" title="keep this VRA at {{ r.mem_gb }}G / {{ r.cpus }} vCPU">pin as is</button></form>{% endif %}
+        </div>{% endif %}
+      </td>
+      <td class="num c3">{{ r.protected_vpgs }} / {{ r.protected_vols }}</td>
+      <td class="num c2">{{ r.recovery_vpgs }} / {{ r.recovery_vols }}</td>
+      <td class="small c3">{{ r.datastore }}</td>
+      <td>{% if r.disconnected %}<span class="tag failure">disconnected</span>{% endif %}
+          {% if r.mask_mismatch %}<span class="tag warning">mask drift</span>{% endif %}
+          {% if r.status != 0 %}<span class="tag warning">status {{ r.status }}</span>{% endif %}
+          {% if not r.disconnected and not r.mask_mismatch and r.status == 0 %}<span class="tag ok">ok</span>{% endif %}
+          {% set hv = (hotspots.by_vra.get((r.host or '').split('.')[0]|lower) if hotspots else none) %}
+          {% if hv and hv.hog %}<div class="small hot" title="{{ hv.hog.write_gb }} of {{ hv.write_gb }} GB written in {{ hotspots.hours }} h">hot spot: {{ hv.hog.name }} {{ (hv.hog.share * 100)|round|int }}%</div>
+          {% elif hv %}<div class="small">{{ hv.write_gb }} GB / {{ hotspots.hours }} h</div>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table></div>
+</div>
+{% else %}<p class="small">No VRAs for this site.</p>{% endfor %}
+
+<h2 id="hotspots">Replication hot spots <span class="small" style="text-transform:none;letter-spacing:0">— last {{ hotspots.hours if hotspots else 24 }} h</span></h2>
+{% if hotspots and hotspots.ready %}
+{% for f in hotspots.flags %}<div class="note">{{ f }}</div>{% endfor %}
+<p class="small">Write volume per VM from Zerto's own per-VM counters - the work its VRAs do: the protected-side VRA splits and ships the writes, the recovery-side VRA writes them into the journal. One VM carrying a large share explains lag that looks like a platform problem. {% if hotspots.coverage_h < hotspots.hours %}Only {{ hotspots.coverage_h }} h of data so far.{% endif %}</p>
+<div class="grid2">
+{% for d in ('inbound', 'outbound') %}{% set x = hotspots[d] %}
+  <div><div class="sub">{{ d|capitalize }} ({{ 'recovering here' if d == 'inbound' else 'protected here' }}) — {{ x.total_gb }} GB from {{ x.vms }} VMs</div>
+  <div class="scroll"><table><tr><th>VM</th><th>zORG</th><th>VRA</th><th class="num">GB</th><th class="num">Share</th><th class="num c3">MB/s</th></tr>
+  {% for v in x.top %}<tr class="{{ 'warning' if v.share >= 0.2 else '' }}"><td class="name">{% if v.vpg_key %}<a href="/vpgs/{{ v.vpg_key|urlencode }}">{{ v.name }}</a>{% else %}{{ v.name }}{% endif %}</td><td class="small">{{ v.org }}</td><td class="small">{{ v.vra }}</td><td class="num">{{ v.write_gb }}</td><td class="num">{{ (v.share * 100)|round(1) }}%</td><td class="num c3">{{ v.mbps if v.mbps is not none else '' }}</td></tr>
+  {% else %}<tr><td colspan="6" class="small">nothing replicated</td></tr>{% endfor %}
+  </table></div></div>
+{% endfor %}
+</div>
+{% else %}<p class="small">Collecting: per-VM replication counters are read every poll; hot spots show once two polls have been taken.</p>{% endif %}
+
+<h2 id="resizes">Resizes</h2>
+{% if halted %}
+<div class="err"><b>Resizing is halted</b> after #{{ halted.push_id }} ({{ (halted.at or '')[:16].replace('T', ' ') }} UTC): {{ halted.reason }}
+  {% if user and user.role == 'admin' %}
+  <form method="post" action="/admin/vras/resize/acknowledge" style="margin-top:.4rem">
+    <input type="hidden" name="back" value="{{ here }}#resizes">
+    <input name="note" required minlength="10" maxlength="500" style="width:min(36rem,100%)" placeholder="what you checked on the VRA and its VPGs, and what you found">
+    <button type="submit">Acknowledge &amp; clear the halt</button>
+  </form>{% endif %}
+</div>{% endif %}
+{% if pushes %}
+<div class="scroll"><table>
+  <tr><th>When</th><th>By</th><th class="c2">Ticket</th><th>Host</th><th>Change</th><th>State</th><th>Detail</th></tr>
+  {% for p in pushes %}
+  <tr class="{{ 'failure' if p.state in ('failed', 'unknown') else ('warning' if p.state == 'refused' else '') }}">
+    <td class="small">#{{ p.id }} {{ (p.at or '')[:16].replace('T', ' ') }}</td><td class="small">{{ p.by_user }}</td>
+    <td class="small c2">{{ p.ticket or '' }}</td><td class="name">{{ p.host }}</td>
+    <td class="mono">{{ p.from_mem }}G/{{ p.from_cpus }} → {{ p.to_mem }}G/{{ p.to_cpus }}{% if p.lowers == '1' %} <span class="tag warning">lower</span>{% endif %}</td>
+    <td><span class="tag {{ {'done': 'ok', 'failed': 'failure', 'unknown': 'failure', 'refused': 'warning'}.get(p.state, 'info') }}">{{ p.state.replace('_', ' ') }}</span></td>
+    <td class="why">{{ p.detail or '' }}
+      {% if p.hold_until and p.state not in ('done', 'refused') and user and user.role == 'admin' %}
+      <form class="inline" method="post" action="/admin/vras/resize/{{ p.id }}/release-holds"><input type="hidden" name="back" value="{{ here }}#resizes"><button class="ghost mini" type="submit">release its VPG holds now</button></form>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+{% else %}<p class="small">No VRA at {{ site }} has been resized from here.</p>{% endif %}
+
+{% if alerts %}
+<h2 id="vra-alerts">VRA alerts at {{ site }}</h2>
+<div class="scroll"><table>
+  <tr><th>Level</th><th>ID</th><th>Host</th><th>Text</th><th>Suggested fix</th><th class="c2">Since</th></tr>
+  {% for a in alerts %}
+  <tr class="{{ 'failure' if a.level == 'Error' else '' }}">
+    <td><span class="tag {{ 'failure' if a.level == 'Error' else 'warning' }}">{{ a.level }}</span></td>
+    <td class="mono">{{ a.id }}</td>
+    <td class="small">{{ a.host or '—' }}</td>
+    <td class="why">{{ a.text }}</td>
+    <td class="fix">{{ fx.cell(a.fixes, [a.id] if a.id else [], here ~ '#vra-alerts', user) }}</td>
+    <td class="small c2">{{ (a.since or '')[:16] }}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+<p class="small">"Host" is filled in when the alert names one of this site's VRA hosts; alerts about hosts at a paired customer site appear here too, because this site's ZVM raises them.</p>
+{% endif %}
+{% endblock %}

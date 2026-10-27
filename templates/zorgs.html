@@ -1,0 +1,23 @@
+{% extends "base.html" %}{% block title %}zORGs · Zerto Monitor{% endblock %}
+{% block body %}
+<h1>zORGs</h1>
+<div class="scroll"><table>
+  <tr><th>zORG</th><th class="num">VPGs</th><th class="num">Failure</th><th class="num">Warning</th><th class="num c2">Healthy</th><th class="num">Ignored</th><th class="c3">Health</th><th class="num c3">Worst RPO</th><th>Last failover test</th><th class="num c2">Never tested</th><th class="num c2">&gt;90d</th><th class="c1">Sites</th></tr>
+  {% for z in zorgs %}
+  <tr class="{{ 'failure' if z.failure else ('warning' if z.warning else '') }}">
+    <td><a href="/zorgs/{{ z.name|urlencode }}">{{ z.name }}</a>{% if z.zorg_ignore %} <span class="tag info" title="{{ z.zorg_ignore.note }}">ignored{{ ' (all)' if z.zorg_ignore.mode == 'all' else '' }}</span>{% endif %}</td>
+    <td class="num">{{ z.vpg_count }}</td>
+    <td class="num">{{ z.failure or '' }}</td><td class="num">{{ z.warning or '' }}</td><td class="num c2">{{ z.healthy }}</td>
+    <td class="num">{{ z.ignored or '' }}</td>
+    <td class="c3"><div class="bar" title="{{ z.pct }}% healthy"><i style="width:{{ z.pct }}%"></i></div></td>
+    <td class="num c3">{{ z.worst_rpo }}</td>
+    <td><span class="tag {{ z.test_health }}">{{ z.last_test }}</span>{% if z.last_test != 'never' %} <span class="small">{{ z.last_test_age }}</span>{% endif %}
+        {% if z.oldest_test != z.last_test and z.oldest_test != 'never' %}<div class="small">oldest {{ z.oldest_test }}</div>{% endif %}</td>
+    <td class="num c2">{{ z.never_tested or '' }}</td>
+    <td class="num c2">{{ z.stale_90d or '' }}</td>
+    <td class="small c1">{{ z.sites|join(', ') }}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+<p class="small">Last failover test = the most recent <code>LastTest</code> across the zORG's VPGs; "oldest" shows the least-recently tested VPG. Green = every VPG tested within 90 days, amber = some never/stale, red = none ever tested.</p>
+{% endblock %}

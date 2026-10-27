@@ -1,0 +1,12 @@
+Zerto Monitor
+Copyright 2026 Zerto Monitor contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is an independent project, not affiliated with, endorsed by or supported by Zerto or Hewlett Packard
+Enterprise. Zerto is a trademark of Zerto Ltd., a Hewlett Packard Enterprise company. VMware and vSphere are
+trademarks of Broadcom. Microsoft and Entra are trademarks of Microsoft Corporation. Ubuntu is a trademark of
+Canonical Ltd.
+
+The appliance image (OVA) is built from Canonical's Ubuntu cloud image, which is distributed under its own
+licences; the disk image is included unmodified.

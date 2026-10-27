@@ -1,0 +1,85 @@
+{% extends "base.html" %}{% block title %}Resize VRA · {{ site }} · Zerto Monitor{% endblock %}
+{% block body %}{% set here = '/vras/' ~ (site|urlencode) %}
+<p class="small"><a href="{{ here }}">← {{ site }} VRAs</a></p>
+{% if pl.error %}<h1>Resize</h1><div class="err">{{ pl.error }}</div>{% else %}
+{% set r = pl.vra %}
+<h1>Resize {{ r.host }} <span class="small" style="font-family:inherit">{{ pl.current[0] }} GB / {{ pl.current[1] }} vCPU → <b>{{ pl.target[0] }} GB / {{ pl.target[1] }} vCPU</b>{% if pl.lower %} (lowering){% endif %}</span></h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+{% if halted %}<div class="err"><b>Resizes are halted</b> after #{{ halted.push_id }}: {{ halted.reason }}. An admin must acknowledge it on the VRA page first.</div>{% endif %}
+
+<div class="note">
+  <b>This is a planned replication outage, not a settings change.</b> Zerto applies it by <b>powering the VRA off</b>.
+  {{ pl.affected.protected }} protected VPG(s) stop replicating, and {{ pl.affected.recovery }} VPG(s) recovering to it
+  cannot fail over until it's back. Afterwards a Bitmap Sync follows; on the protected side it can be a Delta Sync, which reads whole disks
+  on production storage. No checkpoints are written until the sync completes.
+  {% if 'tier_cross' in pl.flags %}<br><b>Driver reload:</b> this crosses the 4/6/8 GB boundary, so the host's Zerto driver also restarts with a new I/O cache size. Zerto doesn't document the effect on production I/O. Use a maintenance window.{% endif %}
+  {% if pl.target[0] > pl.current[0] %}<br><b>Memory raise:</b> VRA memory is fully reserved. Check in vCenter that the host has at least {{ pl.target[0] - pl.current[0] }} GB unreserved and that HA admission control allows it. Otherwise the VRA may not power back on.{% endif %}
+  {% if pl.affected.customer_peers %}<br><b>Customers will see it:</b> {{ pl.affected.customer_peers|join(', ') }} (their own ZVMs will alert).{% endif %}
+</div>
+
+<h2>Checks <span class="small">(as of {{ (pl.as_of or '')[:16].replace('T', ' ') }} UTC - all re-run on a fresh poll just before sending)</span></h2>
+<div class="scroll"><table>
+  <tr><th></th><th>Check</th><th>Result</th></tr>
+  {% for g in pl.gates %}
+  <tr class="{{ '' if g.ok else ('failure' if g.blocking else 'warning') }}">
+    <td><span class="tag {{ 'ok' if g.ok else ('failure' if g.blocking else 'warning') }}">{{ 'pass' if g.ok else ('blocks' if g.blocking else 'note') }}</span></td>
+    <td class="name">{{ g.id }} {{ g.name }}</td>
+    <td class="why">{% if g.ok %}{% if g.id == 'G11' %}checked live just before sending{% else %}ok{% endif %}{% else %}{% for d in g.detail %}<div>{{ d }}</div>{% endfor %}{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+
+<h2>The VRA</h2>
+<div class="card"><div class="kv">
+  <dt>ZVM</dt><dd>{{ pl.source.name if pl.source }} ({{ pl.source.host if pl.source }}), version {{ pl.zvm_version }}</dd>
+  <dt>VRA</dt><dd>{{ r.name }} · id {{ r.id }} · host id {{ r.host_id }} · cluster {{ r.cluster or '?' }}</dd>
+  <dt>State</dt><dd>version {{ r.version }} · status {{ r.status }} · alert status {{ r.alert_status }}{{ ' · VAIO' if r.is_vaio }}</dd>
+  <dt>Network</dt><dd class="mono">{{ r.ip_config }} {{ r.ip }} / {{ r.mask }} gw {{ r.gw }} · group {{ r.group }}</dd>
+  <dt>Rule</dt><dd>{{ pl.rule.source }} standard {{ pl.rule.target[0] }} GB / {{ pl.rule.target[1] }} vCPU{% if pl.rule.support_ref %} · Zerto ref {{ pl.rule.support_ref }}{% endif %}</dd>
+  <dt>Flags</dt><dd>{{ pl.flags|join(', ') or 'none' }}</dd>
+  <dt>Lowering</dt><dd>{% if pl.lower %}<b>chosen for this resize</b> · <a href="{{ here }}/resize?key={{ pl.key|urlencode }}">preview the raise-only change instead</a>
+    {% elif pl.can_lower %}not part of this resize (raise-only). <a href="{{ here }}/resize?key={{ pl.key|urlencode }}&lower=1">Preview lowering it to {{ pl.rule.target[0] }} GB / {{ pl.rule.target[1] }} vCPU</a>{% else %}n/a{% endif %}</dd>
+</div></div>
+
+<h2>Exactly what will be sent</h2>
+<pre>{{ pl.request.method }} {{ pl.request.url }}
+{{ pl.request.body|tojson(indent=2) }}</pre>
+<p class="small">The group and network values are read from the ZVM again just before sending and echoed exactly. If anything differs from what's shown here, or from what the preview saw, nothing is sent. No password is ever sent.</p>
+
+<h2>Blast radius <span class="small">({{ pl.affected.vpgs|length }} VPGs: {{ pl.affected.protected }} protected here, {{ pl.affected.recovery }} recovering here)</span></h2>
+<div class="scroll"><table>
+  <tr><th>VPG</th><th>zORG</th><th>Role</th><th class="c2">Peer</th><th>State</th><th class="num">RPO / target</th><th class="c3">History</th><th class="c2">Alerts</th></tr>
+  {% for v in pl.affected.vpgs %}
+  <tr class="{{ 'warning' if v.status != 'MeetingSLA' or v.sub != 'None' else '' }}">
+    <td class="name">{{ v.name }}</td><td>{{ v.org }}</td><td class="small">{{ v.roles|join(', ') }}</td>
+    <td class="small c2">{{ v.peer }}{% if not v.peer_monitored %} <span class="tag">not monitored</span>{% endif %}</td>
+    <td class="small">{{ v.status }} / {{ v.sub }}{% if v.testing %} · test running{% endif %}</td>
+    <td class="num">{{ v.rpo }} / {{ v.rpo_cfg }}</td><td class="small c3">{{ v.history_cfg_min or '?' }} min</td>
+    <td class="mono c2">{{ v.codes|join(' ') }}</td>
+  </tr>
+  {% else %}<tr><td colspan="8" class="small">No VPG replicates through this VRA.</td></tr>{% endfor %}
+</table></div>
+<p class="small">While the resize runs, these VPGs are <b>held</b>: shown as planned, kept out of the failure/warning counts, alerting and SNMP figures. A hold ends when that VPG recovers, when the resize ends, or after {{ pl.hold_minutes }} minutes at the latest.</p>
+
+{% if user.role == 'admin' %}
+{% if pl.blocking %}<div class="err">Can't start: {{ pl.blocking|length }} check(s) block it (above).</div>{% endif %}
+<form method="post" action="/admin/vras/resize" class="card">
+  <input type="hidden" name="site" value="{{ site }}"><input type="hidden" name="key" value="{{ pl.key }}">
+  <input type="hidden" name="lower" value="{{ '1' if pl.lower else '' }}"><input type="hidden" name="plan_hash" value="{{ pl.plan_hash }}">
+  <div class="formrow" style="max-width:40rem"><label>Ticket / change number<input name="ticket" required maxlength="100"></label></div>
+  <label class="ack"><input type="checkbox" name="ack_outage" value="yes" required> I understand this power-cycles the VRA and {{ pl.affected.vpgs|length }} VPG(s) stop replicating until it's back and synced.</label>
+  <label class="ack"><input type="checkbox" name="ack_vib" value="yes" required> I checked in the Zerto UI (Edit VRA) that this VRA connects to its host by public key (VIB), not a root password.</label>
+  {% if pl.needs.headroom_gb %}<label class="ack"><input type="checkbox" name="ack_headroom" value="yes" required> I checked in vCenter that the host has at least {{ pl.needs.headroom_gb }} GB unreserved and HA admission control allows it.</label>{% endif %}
+  {% if pl.needs.tier_cross %}<label class="ack"><input type="checkbox" name="ack_tier" value="yes" required> This is a maintenance window: the host's Zerto driver reloads.</label>{% endif %}
+  {% if pl.needs.site_alerts %}<label class="ack"><input type="checkbox" name="ack_site" value="yes" required> I've reviewed the site alerts listed under G12: {{ pl.needs.site_alerts|join(', ') }}.</label>{% endif %}
+  {% if pl.needs.vpg_codes %}<label class="ack"><input type="checkbox" name="ack_codes" value="yes" required> I accept that the affected VPGs already carry: {{ pl.needs.vpg_codes|join(', ') }}.</label>{% endif %}
+  {% if pl.needs.typed_host %}<div class="formrow" style="max-width:40rem"><label>Lowering: type the host name in full<input name="typed_host" required autocomplete="off" placeholder="{{ r.host }}"></label></div>{% endif %}
+  <button type="submit" class="danger" {{ 'disabled' if pl.blocking }}>Resize {{ r.host }} now</button>
+  <a class="btn ghost" href="{{ here }}">Cancel</a>
+  <p class="small" style="margin-bottom:0">Sent once and never retried. One resize at a time across the appliance; 30-minute cooldown after each; 24 hours apart until five have succeeded; at most {{ 4 }} a day per site. Any outcome but "done" halts resizing until an admin acknowledges it.</p>
+</form>
+{% else %}
+<p class="small">An admin starts resizes. Send them this page.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

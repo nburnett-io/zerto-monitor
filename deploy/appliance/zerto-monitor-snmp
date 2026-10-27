@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""snmpd 'extend' hook: print one Zerto Monitor metric as a bare integer.
+
+snmpd starts one of these per extend line, so a single SNMP walk would otherwise
+hit the app a dozen times - the answer is cached for 20 seconds.
+
+Prints -1 if the app can't be reached: a value no real metric can take, so an NMS
+can alert on it rather than mistaking an outage for "0 failures".
+"""
+import json
+import os
+import ssl
+import sys
+import tempfile
+import time
+import urllib.request
+
+URL = "https://127.0.0.1/api/metrics"
+CACHE = os.path.join(tempfile.gettempdir(), "zerto-monitor-snmp.json")
+TTL = 20
+
+
+def fetch() -> dict:
+    try:
+        if time.time() - os.stat(CACHE).st_mtime < TTL:
+            with open(CACHE, encoding="utf-8") as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    # local loopback to our own nginx; the certificate is for the public name
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(URL, context=ctx, timeout=15) as r:
+        data = json.load(r)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE), prefix=".zm-snmp-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, CACHE)
+    except OSError:
+        pass
+    return data
+
+
+def main() -> int:
+    key = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        v = fetch().get(key)
+        print(int(v) if v is not None else -1)
+    except Exception:  # noqa: BLE001 - never emit a traceback into an OID
+        print(-1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

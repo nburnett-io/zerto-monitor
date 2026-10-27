@@ -1,0 +1,135 @@
+{% extends "base.html" %}{% block title %}{{ name }} · Zerto Monitor{% endblock %}
+{% block body %}{% import "_ignore.html" as ig %}{% import "_fix.html" as fx %}{% set here = '/zorgs/' ~ (name|urlencode) %}
+<p class="small"><a href="/zorgs">← all zORGs</a></p>
+<h1>{{ name }}</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+{% if zorg_ignore %}<p>{{ ig.badge(zorg_ignore, here, user) }}</p>
+{% elif user and user.can_operate %}<div style="margin:-.4rem 0 .8rem">{{ ig.form('zorg', name, name, here, summary.failure + summary.warning > 0) }}</div>{% endif %}
+<div class="strip">
+  <div class="cell"><div class="k">VPGs</div><div class="v">{{ summary.vpgs }}</div></div>
+  <div class="cell"><div class="k">VMs</div><div class="v">{{ summary.vms }}</div></div>
+  <div class="cell"><div class="k">Failure</div><div class="v fail">{{ summary.failure }}</div></div>
+  <div class="cell"><div class="k">Warning</div><div class="v warn">{{ summary.warning }}</div></div>
+  <div class="cell"><div class="k">Healthy</div><div class="v good">{{ summary.healthy }}</div></div>
+  {% if summary.ignored %}<div class="cell"><div class="k">Ignored</div><div class="v">{{ summary.ignored }}</div></div>{% endif %}
+  <div class="cell"><div class="k">Worst / median RPO</div><div class="v">{{ summary.worst_rpo }}<span class="small"> / {{ summary.median_rpo }}</span></div></div>
+  <div class="cell"><div class="k">No recovery point</div><div class="v {{ 'fail' if summary.no_recovery_point else 'good' }}">{{ summary.no_recovery_point }}</div></div>
+  <div class="cell"><div class="k">Provisioned / used</div><div class="v">{{ summary.prov_tb }}<span class="small"> / {{ summary.used_tb }} TiB</span></div></div>
+  <div class="cell"><div class="k">Journal</div><div class="v">{{ summary.journal_gb }}<span class="small"> GiB</span></div></div>
+  <div class="cell"><div class="k">Throughput</div><div class="v">{{ summary.thru }}<span class="small"> MiB/s</span></div></div>
+  <div class="cell"><div class="k">Last failover test</div><div class="v {{ 'fail' if tests.test_health == 'failure' else ('warn' if tests.test_health == 'warning' else 'good') }}" style="font-size:1rem">{{ tests.last_test }}</div><div class="small">{{ tests.never_tested }} never · {{ tests.stale_90d }} over 90d · oldest {{ tests.oldest_test }}</div></div>
+</div>
+<p class="small">Sites: {{ summary.sites|join(', ') }} ·
+  Monthly report: {% for m in months %}<a href="/reports/{{ name|urlencode }}/{{ m }}">{{ m }}</a> (<a href="/reports/{{ name|urlencode }}/{{ m }}/pdf">PDF</a>){{ ' · ' if not loop.last }}{% endfor %} ·
+  <a href="/timeline?zorg={{ name|urlencode }}">timeline</a> ·
+  <a href="/backups?zorg={{ name|urlencode }}">backups</a>{% if backups.latest %} <span class="small">({{ backups.vpgs }} VPGs, latest {{ backups.latest[:10] }})</span>{% endif %}</p>
+
+<h2 id="plans">DR failover plans</h2>
+{% for p in plans.plans %}
+<div class="planbox"><b>{{ p.name }}</b> <span class="small">at {{ p.site }} · {{ p.type }}</span>
+  <span class="tag {{ 'ok' if p.status in ('Ready', 'Completed') else ('failure' if p.status == 'Error' else 'info') }}">{{ p.status }}</span>
+  <span class="small">{% if p.last_run %}last run {{ p.last_run[:16].replace('T', ' ') }}{% endif %}{% if p.last_ok %} · last successful {{ p.last_ok[:16].replace('T', ' ') }}{% endif %}</span>
+  <ol>{% for t in p.tiers %}<li>{{ t.vpgs|join(', ') }}{% if t.after %} <span class="small">→ {{ t.after|join(' → ') }}</span>{% endif %}</li>{% endfor %}</ol>
+  {% if user and user.can_operate %}<a class="btn ghost" href="/zorgs/{{ name|urlencode }}/plan?site={{ p.site|urlencode }}&id={{ p.id }}">edit…</a>{% endif %}
+  {% if user and user.role == 'admin' %}
+  <details class="ignore" style="display:inline-block"><summary>delete</summary>
+    <form method="post" action="/admin/plans/delete" class="formrow" style="max-width:30rem">
+      <input type="hidden" name="zorg" value="{{ name }}"><input type="hidden" name="site" value="{{ p.site }}"><input type="hidden" name="plan_id" value="{{ p.id }}">
+      <label>Type DELETE<input name="typed" required autocomplete="off"></label><span><button class="danger" type="submit">Delete plan</button></span>
+    </form></details>{% endif %}
+</div>
+{% endfor %}
+{% for site, gaps in plans.missing.items() %}<div class="note"><b>Not in any plan at {{ site }}:</b> {{ gaps|join(', ') }} - a failover of the plan would leave {{ 'it' if gaps|length == 1 else 'them' }} behind.</div>{% endfor %}
+{% for s in plans.sites if not s.has_plan %}
+<p class="small">No recovery plan at {{ s.site }} for {{ s.vpgs }} VPG{{ '' if s.vpgs == 1 else 's' }}{% if not s.monitored %} (site not monitored){% elif not s.readable %} (couldn't read its plans){% endif %}.
+  {% if user and user.can_operate and s.monitored %}<a class="btn" href="/zorgs/{{ name|urlencode }}/plan?site={{ s.site|urlencode }}">Create a failover plan…</a>{% endif %}</p>
+{% endfor %}
+
+<h2>Cloud connectors</h2>
+{% if zcc_alerts %}
+<div class="scroll" style="margin-bottom:.6rem"><table>
+  <tr><th>ZVM alert</th><th>Since</th><th>Text</th><th>Source</th></tr>
+  {% for a in zcc_alerts %}
+  <tr class="{{ 'failure' if a.level == 'Error' else 'warning' }}">
+    <td><span class="tag {{ 'failure' if a.level == 'Error' else 'warning' }}">{{ a.id }}</span></td>
+    <td class="small">{{ (a.since or '')[:16] }}</td><td class="why">{{ a.text }}</td><td class="small">{{ a.source }}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+<p class="small">ZCC0001 = ghost connector (redeploy) · ZCC0002 = connector powered off (peer disconnected) · ZCC0003 = orphaned network. These come from the ZVM and show even without a ZCM source.</p>
+{% endif %}
+{% if cloud_connectors or zcm %}
+<div class="scroll"><table>
+  <tr><th>Connector (ZCM)</th><th>Status</th><th>Ghost</th><th>Site paired</th><th class="num">Progress</th><th>Details</th></tr>
+  {% for c in cloud_connectors %}
+  <tr class="{{ 'failure' if c._healthy == false else ('warning' if c._healthy is none else '') }}">
+    <td>{{ c._name }}</td>
+    <td>{% if c._healthy == true %}<span class="tag ok">{{ c._status }}</span>{% elif c._healthy == false %}<span class="tag failure">{{ c._status }}</span>{% else %}<span class="tag info">{{ c._status }}</span>{% endif %}</td>
+    <td>{% if c._ghost is sameas true %}<span class="tag failure">ghost</span>{% elif c._ghost is sameas false %}<span class="small">no</span>{% else %}<span class="small">?</span>{% endif %}</td>
+    <td>{% if c._paired == false %}<span class="tag failure">no</span>{% elif c._paired %}<span class="small">yes</span>{% endif %}</td>
+    <td class="num">{% if c._progress is not none and (c._status or '')|lower in ('installing', 'removing') %}{{ c._progress }}%{% endif %}</td>
+    <td><details><summary>fields</summary><pre>{% for k, v in c.items() if not k.startswith('_') %}{{ k }}: {{ v }}
+{% endfor %}</pre></details></td>
+  </tr>
+  {% else %}<tr><td colspan="6" class="small">No cloud connectors reported by the ZCM for this zORG.</td></tr>{% endfor %}
+</table></div>
+{% if zcm %}<details><summary>ZCM zORG record</summary><pre>{% for k, v in zcm.items() if not k.startswith('_') %}{{ k }}: {{ v }}
+{% endfor %}</pre></details>{% endif %}
+{% elif not zcc_alerts %}
+<p class="small">No ZCM source connected and no ZCC alerts on the ZVMs for this zORG. Add the ZCM in Admin to see connector status.</p>
+{% endif %}
+
+<h2>VPGs</h2>
+<div class="scroll"><table>
+  <tr><th>State</th><th>VPG</th><th class="c1">Status / substatus</th><th>Why</th><th>Suggested fix</th><th class="num">RPO</th><th class="num c3">Cfg</th><th class="num c3">VMs</th><th class="num c3">Used GiB</th><th class="num c3">MiB/s</th><th class="c2">Path</th><th class="c2">Last test</th></tr>
+  {% for v in vpgs %}
+  <tr class="{{ v.health if (v.health != 'healthy' and not v.ignored) else '' }}">
+    <td><span class="tag {{ v.health }}">{{ v.health }}</span>
+      {% if v.ignored %}<div>{{ ig.badge(v.ignored, here, user) }}</div>
+      {% elif v.health != 'healthy' and user and user.can_operate %}{{ ig.form('vpg', v.key, v.name, here) }}{% endif %}</td>
+    <td class="name"><a href="/vpgs/{{ v.key|urlencode }}">{{ v.name }}</a>
+      <details><summary>{{ v.members|length }} VM{{ '' if v.members|length == 1 else 's' }}</summary>
+        {% for m in v.members %}<div class="small mono">{{ m.name }} · {{ m.protected_host }} → {{ m.recovery_host }} · jrnl {{ m.journal_gb }}G</div>{% endfor %}</details></td>
+    <td class="mono c1">{{ v.status }}<br>{{ v.sub }}</td>
+    <td class="why">{{ v.why }}
+      {% if v.ignore_lapsed %}{{ ig.lapsed(v.ignore_lapsed) }}{% endif %}
+      {% if v.alerts %}<details><summary>{{ v.alerts|length }} alert{{ '' if v.alerts|length == 1 else 's' }}</summary>
+        {% for a in v.alerts %}<div class="small"><span class="tag {{ 'failure' if a.level == 'Error' else 'warning' }}">{{ a.id }}</span> {{ a.text }}</div>{% endfor %}</details>{% endif %}
+    </td>
+    <td class="fix">{% if v.health != 'healthy' %}{{ fx.cell(v.fixes, v.fix_keys, here, user) }}{% endif %}</td>
+    <td class="num">{{ v.rpo_h }}</td><td class="num c3">{{ v.rpo_cfg|age }}</td>
+    <td class="num c3">{{ v.vms }}</td><td class="num c3">{{ v.used_gb }}</td><td class="num c3">{{ '%.1f'|format(v.thru) }}</td>
+    <td class="small c2">{{ v.protected_site }} → {{ v.recovery_site }}</td>
+    <td class="small c2">{{ (v.last_test or '')[:10] }}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+
+<h2 id="activity">Last 30 days</h2>
+{% if recent_tests %}
+<div class="sub">Failover tests &amp; recoveries</div>
+<div class="scroll"><table><tr><th>Started (UTC)</th><th>VPG</th><th>Type</th><th>Result</th><th class="num">RTO</th><th>By</th><th class="c2">Notes</th></tr>
+{% for t in recent_tests %}<tr class="{{ 'failure' if t.ok == false else '' }}"><td class="mono">{{ t.started[:16].replace('T', ' ') }}</td><td class="small"><a href="/vpgs/{{ t.vpg_id|urlencode }}">{{ t.vpg_name }}</a></td><td class="small">{{ t.rtype }}</td>
+  <td><span class="tag {{ 'ok' if t.ok else ('failure' if t.ok == false else 'info') }}">{{ t.status }}</span></td><td class="num">{{ (t.rto_s|int)|age if t.rto_s is not none else '—' }}</td><td class="small">{{ t.by_user }}</td><td class="why c2">{{ t.notes }}</td></tr>{% endfor %}
+</table></div>{% endif %}
+<div class="sub">Changes, pauses, tests <span class="small">— <a href="/timeline?zorg={{ name|urlencode }}">full timeline</a></span></div>
+{% if recent_events %}
+<div class="scroll tl"><table><tr><th>When (UTC)</th><th>What</th><th>VPG</th><th>By</th><th>Detail</th></tr>
+{% for e in recent_events %}<tr class="{{ 'failure' if e.ok == 0 else '' }}"><td class="when">{{ e.when }}</td><td><span class="tag k-{{ e.kind }}">{{ e.label }}</span></td>
+  <td class="small">{% for id, n in e.vpgs %}<a href="/vpgs/{{ id|urlencode }}">{{ n or id[:8] }}</a>{{ ', ' if not loop.last }}{% endfor %}</td><td class="small">{{ e.user or '' }}</td><td class="why">{{ e.text }}</td></tr>{% endfor %}
+</table></div>
+{% else %}<p class="small">Nothing recorded in the last 30 days.</p>{% endif %}
+
+{% if alerts %}
+<h2 id="alerts">Alerts mentioning this zORG</h2>
+<div class="scroll"><table>
+  <tr><th>Level</th><th>ID</th><th class="c2">Since</th><th>Text</th><th>Suggested fix</th><th class="c2">Source</th></tr>
+  {% for a in alerts %}
+  <tr><td><span class="tag {{ 'failure' if a.level == 'Error' else 'warning' }}">{{ a.level }}</span></td>
+      <td class="mono">{{ a.id }}</td><td class="small c2">{{ (a.since or '')[:16] }}</td><td class="why">{{ a.text }}</td>
+      <td class="fix">{{ fx.cell(a.fixes, [a.id] if a.id else [], here ~ '#alerts', user) }}</td>
+      <td class="small c2">{{ a.source }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}

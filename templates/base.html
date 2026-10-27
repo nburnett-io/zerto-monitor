@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Zerto Monitor{% endblock %}</title>
+<script>
+/* apply a pinned theme before first paint, so a dark page never flashes light */
+(function(){try{var t=localStorage.getItem('zm-theme');
+  if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+</script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Source+Sans+3:wght@400;600&display=swap">
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+{% block head %}{% endblock %}
+</head>
+<body>
+<nav>
+  <a href="/" class="brand" aria-label="Zerto Monitor home"><img src="/static/img/logo.svg" alt="Zerto Monitor" height="26"></a>
+  {% set p = request.url.path %}
+  <a href="/" class="{{ 'active' if p == '/' }}">VPG issues</a>
+  <a href="/vras" class="{{ 'active' if p.startswith('/vras') }}">VRAs</a>
+  <a href="/zorgs" class="{{ 'active' if p.startswith('/zorgs') or p.startswith('/vpgs') }}">zORGs</a>
+  <a href="/timeline" class="{{ 'active' if p.startswith('/timeline') }}">Timeline</a>
+  <a href="/backups" class="{{ 'active' if p.startswith('/backups') }}">Backups</a>
+  <a href="/reports" class="{{ 'active' if p.startswith('/reports') }}">Reports</a>
+  <a href="/playbook" class="{{ 'active' if p.startswith('/playbook') }}">Playbook</a>
+  {% if user and user.is_admin %}<a href="/admin" class="{{ 'active' if p.startswith('/admin') }}">Admin</a>{% endif %}
+  <span class="right">{% if user %}{{ user.username }} <span class="tag {{ 'failure' if user.role == 'admin' else ('info' if user.role == 'engineer' else '') }}" title="your role">{{ user.role }}</span> · <a href="/logout">sign out</a>{% else %}<a href="/login?next={{ p|urlencode }}">sign in</a>{% endif %}<button type="button" class="theme-toggle" id="themeToggle" aria-label="Switch colour theme">Theme</button></span>
+</nav>
+<main>{% block body %}{% endblock %}</main>
+<footer class="small">Zerto Monitor v{{ app_version }}</footer>
+{% if autorefresh %}
+<script>
+/* Refresh for fresh data, but never while someone is filling in a form on the page. */
+setInterval(function(){
+  if (document.querySelector('details[open] form, input:focus, select:focus, textarea:focus')) return;
+  location.reload();
+}, {{ autorefresh * 1000 }});
+</script>
+{% endif %}
+<script>
+/* Light/dark toggle. Starts from the pinned choice, else the OS preference;
+   a click pins the other one for this browser. */
+(function(){
+  var b=document.getElementById('themeToggle');if(!b)return;
+  var root=document.documentElement,mq=window.matchMedia('(prefers-color-scheme: dark)');
+  function current(){var a=root.getAttribute('data-theme');return a?a:(mq.matches?'dark':'light');}
+  function paint(){var dark=current()==='dark';
+    b.textContent=dark?'☀ Light':'☾ Dark';
+    b.setAttribute('aria-pressed',dark?'true':'false');
+    b.title='Currently '+current()+' - switch to '+(dark?'light':'dark');}
+  b.addEventListener('click',function(){
+    var next=current()==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('zm-theme',next);}catch(e){}
+    paint();});
+  if(mq.addEventListener)mq.addEventListener('change',paint);
+  paint();
+})();
+</script>
+</body>
+</html>

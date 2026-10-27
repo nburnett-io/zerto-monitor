@@ -1,0 +1,338 @@
+#!/usr/bin/python3
+"""Zerto Monitor signed self-update (root). Run by zerto-monitor-update.service only.
+
+A release bundle (zerto-monitor-<version>.zmupdate) is a tar of exactly three files:
+  manifest.json   {"product", "version", "payload", "sha256", "size", "built_at", "key_id"}
+  manifest.sig    raw Ed25519 signature of manifest.json's bytes
+  payload.tar.xz  the same payload an OVA carries (app/, templates/, static/, appliance/, ...)
+
+The signature is checked with OpenSSL against the PINNED public key in
+/etc/zerto-monitor/release-signing.pub (root-owned). The private key never leaves the
+release workstation. So whoever starts an update - an admin in the portal, or a deploy
+token on the API - can only install a genuine release; nothing else runs as root.
+
+Flow: copy the staged bundle somewhere root-private (the app can't swap it afterwards)
+-> verify signature, payload hash, product, version (newer than installed unless the
+request allows a downgrade/reinstall) and every payload path -> back up code + database
+-> swap the code in -> firstboot.py --upgrade -> health check. If anything after the swap
+fails, the previous code is restored and the previous version re-applied (rolled_back).
+
+Status for the web app: /var/lib/zerto-monitor/update-status.json (0644, no secrets).
+Detail: /var/log/zerto-monitor-update.log (0600).
+
+Diagnostics:  zerto-monitor-update check <bundle>
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import ssl
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+APP = Path("/opt/zerto-monitor")
+PUBKEY = Path("/etc/zerto-monitor/release-signing.pub")
+WORK = Path("/var/lib/zerto-monitor-update")           # root 0700
+INCOMING = WORK / "incoming.zmupdate"
+REQUEST = WORK / "request.json"
+STATUS = Path("/var/lib/zerto-monitor/update-status.json")
+LOG = Path("/var/log/zerto-monitor-update.log")
+BACKUPS = Path("/var/backups/zerto-monitor")
+CODE = ("app", "templates", "static", "appliance", "firstboot.py", "requirements.txt", "VERSION")
+ALLOWED_TOP = set(CODE)
+MAX_BUNDLE = 64 << 20
+VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+
+
+class Refused(Exception):
+    pass
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg: str) -> None:
+    fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(f"{now()} {msg}\n")
+
+
+def status(**kw) -> None:
+    cur = {}
+    try:
+        cur = json.loads(STATUS.read_text())
+    except (OSError, ValueError):
+        pass
+    cur.update(kw, updated=now())
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS.with_name(STATUS.name + ".new")
+    tmp.write_text(json.dumps(cur, indent=1))
+    tmp.chmod(0o644)
+    tmp.replace(STATUS)
+
+
+def vtuple(v: str) -> tuple:
+    return tuple(int(x) for x in v.split("."))
+
+
+def installed_version() -> str:
+    try:
+        return (APP / "VERSION").read_text().strip() or "0"
+    except OSError:
+        return "0"
+
+
+# ── verification ────────────────────────────────────────────────────────────
+def read_bundle(path: Path) -> tuple[bytes, bytes, Path, str]:
+    """-> (manifest bytes, signature, extracted payload path, payload sha256)."""
+    if path.stat().st_size > MAX_BUNDLE:
+        raise Refused("bundle is implausibly large")
+    out = Path(tempfile.mkdtemp(prefix="bundle-", dir=WORK))
+    with tarfile.open(path, "r:") as t:
+        members = {m.name: m for m in t.getmembers()}
+        if set(members) != {"manifest.json", "manifest.sig", "payload.tar.xz"} or \
+                not all(m.isfile() for m in members.values()):
+            raise Refused(f"not a release bundle (entries: {sorted(members)[:6]})")
+        manifest = t.extractfile(members["manifest.json"]).read()
+        sig = t.extractfile(members["manifest.sig"]).read()
+        payload = out / "payload.tar.xz"
+        h = hashlib.sha256()
+        with t.extractfile(members["payload.tar.xz"]) as src, open(payload, "wb") as dst:
+            for blk in iter(lambda: src.read(1 << 20), b""):
+                h.update(blk)
+                dst.write(blk)
+    return manifest, sig, payload, h.hexdigest()
+
+
+def verify_signature(manifest: bytes, sig: bytes) -> None:
+    if not PUBKEY.is_file():
+        raise Refused(f"no release signing key pinned at {PUBKEY}")
+    with tempfile.TemporaryDirectory(dir=WORK) as d:
+        m, s = Path(d) / "m", Path(d) / "s"
+        m.write_bytes(manifest)
+        s.write_bytes(sig)
+        p = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(PUBKEY), "-rawin",
+                            "-in", str(m), "-sigfile", str(s)], capture_output=True, text=True, timeout=60)
+    if p.returncode != 0 or "Signature Verified Successfully" not in (p.stdout + p.stderr):
+        raise Refused("SIGNATURE INVALID - this bundle was not signed with the pinned release key")
+
+
+def check_manifest(manifest: bytes, payload_sha: str, allow_downgrade: bool) -> dict:
+    try:
+        m = json.loads(manifest)
+    except ValueError:
+        raise Refused("manifest is not JSON") from None
+    if m.get("product") != "zerto-monitor":
+        raise Refused("bundle is not a Zerto Monitor release")
+    v = str(m.get("version") or "")
+    if not VERSION_RE.match(v):
+        raise Refused(f"bad version {v!r}")
+    if m.get("sha256") != payload_sha:
+        raise Refused("payload does not match the signed manifest (hash differs)")
+    cur = installed_version()
+    if VERSION_RE.match(cur) and vtuple(v) <= vtuple(cur) and not allow_downgrade:
+        raise Refused(f"{v} is not newer than the installed {cur} (a reinstall/downgrade must be allowed explicitly)")
+    return m
+
+
+def check_payload(payload: Path, version: str) -> None:
+    with tarfile.open(payload, "r:xz") as t:
+        names = []
+        for mem in t.getmembers():
+            parts = PurePosixPath(mem.name).parts
+            if (mem.name.startswith("/") or ".." in parts or not parts or parts[0] not in ALLOWED_TOP
+                    or not (mem.isfile() or mem.isdir())):
+                raise Refused(f"payload has an unexpected entry {mem.name!r}")
+            names.append(mem.name)
+        if "firstboot.py" not in names:
+            raise Refused("payload has no firstboot.py")
+        if "VERSION" in names:
+            pv = t.extractfile("VERSION").read().decode().strip()
+            if pv != version:
+                raise Refused(f"payload says {pv} but the manifest says {version}")
+
+
+def verify(path: Path, allow_downgrade: bool) -> tuple[dict, Path]:
+    manifest, sig, payload, sha = read_bundle(path)
+    verify_signature(manifest, sig)
+    m = check_manifest(manifest, sha, allow_downgrade)
+    check_payload(payload, m["version"])
+    return m, payload
+
+
+# ── apply / rollback ────────────────────────────────────────────────────────
+def backup() -> Path:
+    BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    b = BACKUPS / f"pre-update-{time.strftime('%Y%m%d-%H%M%S')}"
+    b.mkdir(mode=0o700)
+    for name in CODE:
+        src = APP / name
+        if src.is_dir():
+            shutil.copytree(src, b / name, symlinks=True)
+        elif src.exists():
+            shutil.copy2(src, b / name)
+    db = APP / "data" / "monitor.db"
+    if db.exists():
+        old = os.umask(0o077)
+        try:
+            c = sqlite3.connect(str(db), timeout=60)
+            c.execute("VACUUM INTO ?", (str(b / "monitor.db"),))
+            c.close()
+        finally:
+            os.umask(old)
+    olds = sorted((p for p in BACKUPS.iterdir() if p.name.startswith(("pre-update-", "pre-upgrade-"))),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in olds[3:]:
+        shutil.rmtree(p, ignore_errors=True)
+    return b
+
+
+def install_code(src_root: Path) -> None:
+    for name in CODE:
+        dest, src = APP / name, src_root / name
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        elif dest.exists():
+            dest.unlink()
+        if src.is_dir():
+            shutil.copytree(src, dest, symlinks=False)
+        elif src.exists():
+            shutil.copy2(src, dest)
+
+
+def run_upgrade() -> bool:
+    # 1200 s: install + rollback (2 x this + 2 x 150 s health) must fit the unit's
+    # TimeoutStartSec=3600, or systemd kills us mid-way and nothing rolls back
+    p = subprocess.run(["/usr/bin/python3", str(APP / "firstboot.py"), "--upgrade"], capture_output=True,
+                       text=True, stdin=subprocess.DEVNULL, timeout=1200)
+    for ln in (p.stdout + p.stderr).splitlines()[-40:]:
+        log("  | " + ln)
+    return p.returncode == 0
+
+
+def healthy(expected: str, timeout: int = 150) -> bool:
+    """/healthz says ok AND (when it reports one) the version we expect - so a still-running
+    old process can't pass for the new one."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE                 # loopback to our own nginx
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen("https://127.0.0.1/healthz", context=ctx, timeout=10) as r:
+                j = json.loads(r.read())
+                if r.status == 200 and j.get("ok") and j.get("version", expected) == expected:
+                    return True
+        except Exception:                           # noqa: BLE001
+            pass
+        time.sleep(3)
+    return False
+
+
+def apply(path: Path, allow_downgrade: bool, by: str) -> int:
+    before = installed_version()
+    status(state="verifying", started=now(), finished=None, from_version=before, to_version=None, by=by,
+           detail="checking the bundle's signature and contents")
+    try:
+        m, payload = verify(path, allow_downgrade)
+    except (Refused, tarfile.TarError, OSError) as e:   # a corrupt/unreadable bundle: nothing touched
+        log(f"REFUSED: {e}")
+        status(state="refused", finished=now(), detail=str(e))
+        return 2
+    to = m["version"]
+    log(f"verified {to} (key {m.get('key_id', '?')}, sha256 {m['sha256'][:16]}...) - installing over {before}")
+    status(state="installing", to_version=to, detail=f"backing up {before}, then installing {to}")
+    try:
+        b = backup()
+    except Exception as e:                          # noqa: BLE001 - nothing has been touched yet
+        log(f"REFUSED: backup failed, nothing installed: {e!r}")
+        status(state="refused", finished=now(),
+               detail=f"the backup failed, so {to} was not installed and {before} is untouched: {e}"[:300])
+        return 2
+    log(f"backup: {b}")
+    try:                                            # from here on, ANY error rolls back
+        stage = Path(tempfile.mkdtemp(prefix="payload-", dir=WORK))
+        with tarfile.open(payload, "r:xz") as t:
+            t.extractall(stage, filter="data")
+        install_code(stage)
+        status(detail=f"running the installer for {to} (packages, venv, services); the web app restarts")
+        ok = run_upgrade() and healthy(to) and installed_version() == to
+    except Exception as e:                          # noqa: BLE001
+        log(f"ERROR installing {to}: {e!r}")
+        ok = False
+    if ok:
+        log(f"DONE: {before} -> {to}")
+        status(state="done", finished=now(), detail=f"updated {before} -> {to}; backup {b.name}")
+        return 0
+    log(f"FAILED installing {to} - rolling back to {before}")
+    status(state="rolling_back", detail=f"{to} failed its checks - restoring {before}")
+    try:
+        install_code(b)
+        back_ok = run_upgrade() and healthy(before)
+    except Exception as e:                          # noqa: BLE001
+        log(f"ERROR restoring {before}: {e!r}")
+        back_ok = False
+    status(state="rolled_back" if back_ok else "failed", finished=now(),
+           detail=(f"{to} failed its health check; {before} was restored and is running" if back_ok else
+                   f"{to} failed and restoring {before} did not pass its health check either - "
+                   f"use the console menu (Upgrade > Repair) or restore {b} by hand"))
+    return 1
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(WORK, 0o700)
+    if len(sys.argv) >= 3 and sys.argv[1] == "check":
+        try:
+            m, _ = verify(Path(sys.argv[2]), True)
+            print(json.dumps({"ok": True, "version": m["version"], "installed": installed_version()}))
+            return 0
+        except Refused as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return 2
+    if sys.argv[1:] != ["run"]:
+        sys.exit("usage: zerto-monitor-update run | check <bundle>")
+    import fcntl                                    # Linux only; imported here so tests can load the module
+    lock = open(WORK / ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("another update is running")
+    try:
+        req = json.loads(REQUEST.read_text()) if REQUEST.exists() else {}
+    except ValueError:
+        req = {}
+    REQUEST.unlink(missing_ok=True)
+    if not INCOMING.exists():
+        status(state="refused", finished=now(), detail="nothing was staged")
+        return 2
+    try:
+        return apply(INCOMING, bool(req.get("allow_downgrade")), str(req.get("by") or "?")[:64])
+    finally:
+        INCOMING.unlink(missing_ok=True)
+        for p in WORK.iterdir():
+            if p.is_dir() and p.name.startswith(("bundle-", "payload-")):
+                shutil.rmtree(p, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:                        # noqa: BLE001
+        log(f"FATAL: {exc!r}")
+        try:
+            status(state="failed", finished=now(), detail=f"updater error: {exc}"[:300])
+        except Exception:                           # noqa: BLE001
+            pass
+        sys.exit(1)

@@ -1,0 +1,87 @@
+{% extends "base.html" %}{% block title %}Updates · Zerto Monitor{% endblock %}
+{% if status.state in ('verifying', 'installing', 'rolling_back') %}{% set autorefresh = 10 %}{% endif %}
+{% block body %}
+<p class="small"><a href="/admin">← Admin</a></p>
+<h1>Updates</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+{% if new_token %}
+<div class="note"><b>Deploy token "{{ new_token_name }}" - copy it now, it is not shown again:</b><br>
+  <code style="font-size:.95rem;user-select:all">{{ new_token }}</code><br>
+  <span class="small">It can only list, fetch and install <b>newer signed</b> releases. Store it where the person or tool doing the deploy keeps secrets; revoke it below when done.</span></div>
+{% endif %}
+<div class="strip">
+  <div class="cell"><div class="k">Installed</div><div class="v">{{ installed }}</div></div>
+  <div class="cell"><div class="k">Release key</div><div class="v" style="font-size:.9rem">{{ key_id or 'none installed' }}</div><div class="small">only bundles signed with it install</div></div>
+  <div class="cell"><div class="k">Last update</div><div class="v" style="font-size:1rem">
+    {% if status.state %}<span class="tag {{ {'done': 'ok', 'failed': 'failure', 'rolled_back': 'warning', 'refused': 'warning'}.get(status.state, 'info') }}">{{ status.state.replace('_', ' ') }}</span>{% else %}—{% endif %}</div>
+    <div class="small">{% if status.to_version %}{{ status.from_version }} → {{ status.to_version }}{% endif %}{% if status.updated %} · {{ status.updated[:16].replace('T', ' ') }} UTC{% endif %}{% if status.by %} · {{ status.by }}{% endif %}</div></div>
+</div>
+{% if status.detail %}<p class="small">{{ status.detail }}</p>{% endif %}
+
+<h2>Install a release</h2>
+<div class="card">
+  {% if staged %}
+    {% if staged.error %}<div class="err">Staged file refused: {{ staged.error }}</div>
+    {% else %}
+    <p style="margin-top:0"><b>Ready: {{ staged.version }}</b> <span class="tag {{ 'ok' if staged.relation == 'newer' else 'warning' }}">{{ staged.relation }} than {{ staged.installed }}</span>
+      <span class="small">signed by key {{ staged.key_id }} · built {{ (staged.built_at or '')[:16].replace('T', ' ') }} UTC · payload {{ ((staged.size or 0) / 1024)|round|int }} KB</span></p>
+    <form method="post" action="/admin/updates/apply" class="formrow" style="max-width:56rem">
+      <label>Type the version to confirm<input name="typed" required autocomplete="off" placeholder="{{ staged.version }}"></label>
+      {% if staged.relation != 'newer' %}<label><span>Reinstall / downgrade</span><span><input type="checkbox" name="allow_downgrade" value="1"> yes, install {{ staged.version }} over {{ staged.installed }}</span></label>{% endif %}
+      <span><button type="submit">Apply update</button></span>
+    </form>
+    {% endif %}
+    <form method="post" action="/admin/updates/discard" class="inline"><button class="ghost" type="submit">Discard</button></form>
+    <p class="small">Applying backs up the code and database, installs, runs the installer and health-checks the site. If the check fails, the previous version is restored automatically. The web app restarts (about a minute); sessions survive.</p>
+  {% else %}
+  <p class="small" style="margin-top:0">Nothing staged. Pick a published release, or upload a signed <code>.zmupdate</code> bundle.</p>
+  {% endif %}
+
+  <div class="sub">Published releases <span class="small">({{ source or 'no release index configured' }})</span></div>
+  {% if not source %}<p class="small">No release index configured - set one under "release source" below, or upload a signed <code>.zmupdate</code>.</p>
+  {% elif releases_err %}<p class="small">Couldn't read the release index: {{ releases_err }}</p>
+  {% elif releases %}
+  <div class="scroll"><table><tr><th>Version</th><th></th><th>Published</th><th></th></tr>
+  {% for r in releases[:12] %}<tr><td class="mono">{{ r.version }}</td>
+    <td><span class="tag {{ 'ok' if r.relation == 'newer' else ('info' if r.relation == 'same' else '') }}">{{ 'installed' if r.relation == 'same' else r.relation }}</span></td>
+    <td class="small">{{ (r.published or '')[:16].replace('T', ' ') }}</td>
+    <td>{% if r.relation != 'same' %}<form class="inline" method="post" action="/admin/updates/fetch"><input type="hidden" name="version" value="{{ r.version }}"><button class="ghost mini" type="submit">Download &amp; check</button></form>{% endif %}</td></tr>{% endfor %}
+  </table></div>
+  {% else %}<p class="small">The index lists no releases yet.</p>{% endif %}
+
+  <div class="sub">Upload a bundle</div>
+  <form method="post" action="/admin/updates/upload" enctype="multipart/form-data" class="formrow" style="max-width:48rem">
+    <label>Release bundle (.zmupdate)<input type="file" name="bundle" accept=".zmupdate" required></label>
+    <span><button type="submit">Upload &amp; check</button></span>
+  </form>
+  <details class="ignore"><summary>release source</summary>
+    <form method="post" action="/admin/updates/source" class="formrow" style="max-width:56rem">
+      <label>Release index URL<input name="url" value="{{ source }}" placeholder="https://github.com/OWNER/REPO/releases/latest/download/releases.json"></label>
+      <span><button class="ghost" type="submit">Save</button></span>
+    </form>
+    <p class="small">Either a Gitea/Forgejo generic-package base URL, e.g. <code>https://git.example.com/api/packages/OWNER/generic</code>,
+      or the full URL of a <code>releases.json</code> index, e.g. <code>https://github.com/OWNER/REPO/releases/latest/download/releases.json</code>.
+      Both are fetched without credentials (redirects followed); only bundles signed with this appliance's release key install. Blank = none.</p></details>
+</div>
+
+<h2>Deploy tokens</h2>
+<div class="card">
+  <p class="small" style="margin-top:0">For a person or tool (another engineer, a script, another Claude instance) that deploys without an admin login or SSH.
+    A token can call <code>GET /api/update/status</code>, <code>GET /api/update/available</code> and <code>POST /api/update/apply</code> with <code>{"version": "x.y.z"}</code> -
+    nothing else, and only <b>newer, signed</b> releases. Only a hash is stored. See <code>deploy/UPDATING.md</code>.</p>
+  <form method="post" action="/admin/updates/tokens" class="formrow" style="max-width:48rem">
+    <label>Name<input name="name" required maxlength="60" placeholder="who or what uses it"></label>
+    <div class="fld"><span class="fl">Expires after</span><select aria-label="Expires after" name="days">{% for d in (1, 7, 30, 90, 365) %}<option value="{{ d }}" {{ 'selected' if d == 30 }}>{{ d }} day{{ '' if d == 1 else 's' }}</option>{% endfor %}</select></div>
+    <span><button type="submit">Create token</button></span>
+  </form>
+  {% if tokens %}
+  <div class="scroll"><table><tr><th>Name</th><th>Created</th><th>Expires</th><th>Last used</th><th></th></tr>
+  {% for t in tokens %}{% set dead = t.revoked_at or t.expires_at <= now_iso %}
+  <tr style="{{ 'opacity:.55' if dead }}"><td>{{ t.name }}</td><td class="small">{{ t.created_by }} {{ (t.created_at or '')[:10] }}</td>
+    <td class="small">{% if t.revoked_at %}revoked {{ t.revoked_at[:10] }}{% else %}{{ (t.expires_at or '')[:10] }}{% endif %}</td>
+    <td class="small">{{ (t.last_used_at or 'never')[:16].replace('T', ' ') }}</td>
+    <td>{% if not dead %}<form class="inline" method="post" action="/admin/updates/tokens/{{ t.id }}/revoke"><button class="danger mini" type="submit">Revoke</button></form>{% endif %}</td></tr>
+  {% endfor %}</table></div>
+  {% endif %}
+</div>
+{% endblock %}

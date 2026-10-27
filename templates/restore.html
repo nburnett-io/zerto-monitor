@@ -1,0 +1,37 @@
+{% extends "base.html" %}{% block title %}Restore VPG · Zerto Monitor{% endblock %}
+{% block body %}
+<p class="small"><a href="/backups">← backups</a></p>
+{% if pl.error %}<h1>Restore</h1><div class="err">{{ pl.error }}</div>{% else %}{% set b = pl.backup %}{% set s = pl.summary %}
+<h1>Restore {{ b.vpg_name }}</h1>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}{% if err %}<div class="err">{{ err }}</div>{% endif %}
+<p>Re-creates this VPG in Zerto from its settings as exported <b>{{ b.export_ts[:16].replace('T', ' ') }} UTC</b>, using Zerto's own import on
+  <b>{{ b.site }}</b>. It starts like a new VPG: an <b>initial sync</b> of every protected disk, and <b>no journal history</b> until it builds up again.
+  The protected VMs must still exist. Nothing is overwritten: if a VPG with this name or identifier exists, the restore is refused.</p>
+<dl class="kv">
+  <dt>zORG</dt><dd>{{ b.zorg or '—' }}</dd><dt>Path</dt><dd>{{ s.protected_site }} → {{ s.recovery_site }}</dd>
+  <dt>VMs / volumes</dt><dd>{{ s.vms }} / {{ s.volumes }}</dd><dt>RPO · journal</dt><dd>{{ s.rpo_s|age }} · {{ s.journal_h }} h</dd>
+  <dt>Recovery target</dt><dd>{{ s.target }}</dd>
+  <dt>Request</dt><dd class="mono" style="font-family:var(--mono);font-size:.8rem">{{ pl.request.method }} {{ pl.request.url }} — vpgNames {{ pl.request.vpgNames }} + the backed-up settings</dd>
+</dl>
+{% if pl.problems %}
+<div class="err"><b>Can't restore right now:</b><ul style="margin:.3rem 0 0 1.1rem;padding:0">{% for p in pl.problems %}<li>{{ p }}</li>{% endfor %}</ul></div>
+{% elif user and user.role == 'admin' %}
+<form method="post" action="/admin/backups/{{ b.id }}/restore" class="card" style="max-width:48rem">
+  <input type="hidden" name="plan_hash" value="{{ pl.plan_hash }}">
+  <div class="formrow">
+    <label>Ticket / change<input name="ticket" required maxlength="100"></label>
+    <label>Type the VPG name to confirm<input name="typed_name" required autocomplete="off" placeholder="{{ b.vpg_name }}"></label>
+  </div>
+  <label class="ack"><input type="checkbox" name="ack_sync" value="yes"> I understand it starts with an initial sync and no journal history, and the customer's DR point-in-time history starts again from now.</label>
+  <button type="submit">Restore the VPG</button>
+</form>
+{% else %}<p class="small">Everything is in place. An admin starts the restore from this page.</p>{% endif %}
+{% endif %}
+{% if restores %}
+<h2>Recent restores</h2>
+<div class="scroll"><table><tr><th>#</th><th>When</th><th>By</th><th>VPG</th><th>State</th><th>Detail</th></tr>
+{% for c in restores %}<tr class="{{ 'failure' if c.state in ('failed', 'unknown') else '' }}"><td>{{ c.id }}</td><td class="small">{{ c.at[:16].replace('T', ' ') }}</td><td class="small">{{ c.by_user }}</td><td>{{ c.target }}</td>
+  <td><span class="tag {{ {'done': 'ok', 'failed': 'failure', 'unknown': 'failure', 'refused': 'warning'}.get(c.state, 'info') }}">{{ c.state }}</span></td><td class="why">{{ c.detail or '' }}</td></tr>{% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}

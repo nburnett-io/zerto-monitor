@@ -1,0 +1,86 @@
+{
+ "snapshots": [
+  {
+   "payload": {
+    "site": "Site-A",
+    "version": "10.9.0",
+    "site_type": "VCD",
+    "location": "Test",
+    "flavour": "appliance",
+    "collected_at": "2026-10-05T20:59:34+00:00",
+    "duration_ms": 573,
+    "vpgs": [
+     {
+      "name": "Template-VPG",
+      "id": "00000000-aaaa-bbbb-cccc-000000000000",
+      "org": "TemplateOrg",
+      "zorg_id": "z-template",
+      "status": "MeetingSLA",
+      "sub": "None",
+      "rpo": 10,
+      "rpo_cfg": 300,
+      "progress": 0,
+      "thru": 4.1162109375,
+      "iops": 48,
+      "vms": 1,
+      "prov_gb": 166.1,
+      "used_gb": 108.4,
+      "protected_site": "Site-B",
+      "recovery_site": "Site-A",
+      "direction": "outbound",
+      "priority": 1,
+      "service_profile": "Default",
+      "last_test": null,
+      "members": [],
+      "protected_hosts": [],
+      "on_disconnected_vra": [],
+      "alerts": [],
+      "health": "healthy"
+     }
+    ],
+    "vras": [
+     {
+      "name": "Z-VRA-esx00",
+      "host": "esx00.site-a.example.invalid",
+      "ip": "192.0.2.10",
+      "mask": "255.255.255.0",
+      "gw": "192.0.2.1",
+      "mask_expected": "255.255.255.0",
+      "mask_mismatch": false,
+      "status": 0,
+      "version": "10.9.0",
+      "host_version": "8.0.3",
+      "mem_gb": 48,
+      "cpus": 4,
+      "datastore": "DS-TEST",
+      "protected_vpgs": 0,
+      "protected_vols": 0,
+      "recovery_vpgs": 17,
+      "recovery_vols": 32,
+      "disconnected": false,
+      "alert_status": 0,
+      "id": "1000",
+      "host_id": "host-0",
+      "datastore_id": "datastore-0",
+      "network_id": "dvportgroup-0",
+      "cluster": "C0",
+      "cluster_id": "domain-c0"
+     }
+    ],
+    "alerts": [],
+    "peers": [],
+    "peer_down": [],
+    "zorgs": [],
+    "plans": [],
+    "site_id": "site-0",
+    "counts": {
+     "vpgs": 1,
+     "failure": 0,
+     "warning": 0,
+     "healthy": 1,
+     "vras": 1
+    }
+   }
+  }
+ ]
+}

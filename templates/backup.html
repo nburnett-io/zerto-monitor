@@ -1,0 +1,41 @@
+{% extends "base.html" %}{% block title %}{{ b.vpg_name }} backup · Zerto Monitor{% endblock %}
+{% block body %}
+<p class="small"><a href="/backups?q={{ b.vpg_name|urlencode }}">← backups</a>{% if b.vpg_id %} · <a href="/vpgs/{{ b.vpg_id|urlencode }}">VPG page</a>{% endif %}</p>
+<h1>{{ b.vpg_name }} <span class="small">— settings as exported {{ b.export_ts[:16].replace('T', ' ') }} UTC</span></h1>
+<div class="strip">
+  <div class="cell"><div class="k">zORG</div><div class="v" style="font-size:1rem">{{ b.zorg or '—' }}</div></div>
+  <div class="cell"><div class="k">Path</div><div class="v" style="font-size:.9rem">{{ summary.protected_site }} → {{ summary.recovery_site }}</div></div>
+  <div class="cell"><div class="k">RPO target</div><div class="v">{{ summary.rpo_s|age }}</div></div>
+  <div class="cell"><div class="k">Journal history</div><div class="v">{{ summary.journal_h }}<span class="small"> h</span></div></div>
+  <div class="cell"><div class="k">VMs / volumes</div><div class="v">{{ summary.vms }}<span class="small"> / {{ summary.volumes }}</span></div></div>
+  <div class="cell"><div class="k">In Zerto now</div><div class="v" style="font-size:1rem">{% if exists %}<span class="tag ok">yes</span>{% else %}<span class="tag warning">deleted</span>{% endif %}</div></div>
+</div>
+<dl class="kv">
+  <dt>Recovery target</dt><dd>{{ summary.target or '—' }}</dd>
+  <dt>Journal limits</dt><dd>{{ summary.journal_limit }}</dd>
+  <dt>Priority · WAN compression</dt><dd>{{ summary.priority }} · {{ 'on' if summary.wan_compression else 'off' }}</dd>
+  <dt>Test reminder</dt><dd>{{ ((summary.test_interval_min or 0) * 60)|age if summary.test_interval_min else 'none' }}</dd>
+  <dt>Recovery scripts</dt><dd>{{ 'pre ' if summary.pre_script }}{{ 'post' if summary.post_script }}{{ 'none' if not (summary.pre_script or summary.post_script) }} <span class="small">(parameters are never shown)</span></dd>
+</dl>
+{% if not exists and user and user.can_operate %}<p><a class="btn" href="/backups/{{ b.id }}/restore">Restore this VPG…</a> <span class="small">re-creates it in Zerto from this backup (admin, gated)</span></p>{% endif %}
+
+<h2>What changed</h2>
+<form method="get" class="formrow" style="max-width:40rem">
+  <div class="fld"><span class="fl">Compare with</span><select aria-label="Compare with" name="against">{% for c in copies if c.id != b.id %}<option value="{{ c.id }}" {{ 'selected' if other and c.id == other.id }}>{{ c.export_ts[:16].replace('T', ' ') }} ({{ c.origin }})</option>{% endfor %}</select></div>
+  <span><button type="submit">Compare</button></span>
+</form>
+{% if other %}
+  {% if changes %}
+  <p class="small">{{ changes|length }} setting{{ '' if changes|length == 1 else 's' }} differ between {{ [other.export_ts, b.export_ts]|min|replace('T', ' ') }} and {{ [other.export_ts, b.export_ts]|max|replace('T', ' ') }} (older → newer).</p>
+  <div class="scroll diff"><table><tr><th>Setting</th><th>Before</th><th>After</th></tr>
+  {% for c in changes %}<tr><td class="path">{{ c.path }}</td><td class="old">{{ c.old }}</td><td class="new">{{ c.new }}</td></tr>{% endfor %}
+  </table></div>
+  {% else %}<p class="small">No setting differs from the {{ other.export_ts[:16].replace('T', ' ') }} backup.</p>{% endif %}
+{% else %}<p class="small">This is the only stored backup of this VPG - nothing to compare with yet.</p>{% endif %}
+
+<h2>All settings</h2>
+<details><summary>{{ flat|length }} values</summary>
+<div class="scroll diff"><table><tr><th>Setting</th><th>Value</th></tr>
+{% for f in flat %}<tr><td class="path">{{ f.path }}</td><td class="new" style="color:var(--ink)">{{ f.value }}</td></tr>{% endfor %}
+</table></div></details>
+{% endblock %}
